@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "libfs",
+    "mkfs",
+    "rustfs",
+]
+resolver = "2"
