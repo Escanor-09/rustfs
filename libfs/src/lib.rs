@@ -1,3 +1,4 @@
+pub mod bitmap;
 pub mod disk;
 pub mod layout;
 
