@@ -12,7 +12,7 @@ pub const FT_SYMLINK: u8 = 7;
 #[repr(C)]
 pub struct Superblock {
     pub magic: u32,
-    pub block_Size: u32,
+    pub block_size: u32,
     pub total_blocks: u64,
     pub total_inodes: u64,
     pub free_blocks: u64,
@@ -21,7 +21,7 @@ pub struct Superblock {
     pub data_bitmap_block: u64,
     pub inode_table_block: u64,
     pub journal_start_block: u64,
-    pub data_Start_block: u64,
+    pub data_start_block: u64,
     pub _padding: [u8; 3996],
 }
 
