@@ -9,7 +9,10 @@ pub const FT_DIRECTORY: u8 = 2;
 pub const FT_SYMLINK: u8 = 7;
 
 //Struct of the Superblock which contains the information of all the blocks
+//#[] is an attribute syntax
+//#[repr(C)] tells the program use C- compatible memory layout for this type
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct Superblock {
     pub magic: u32,
     pub block_size: u32,
@@ -27,6 +30,7 @@ pub struct Superblock {
 
 //Inode Table Struct
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct Inode {
     pub mode: u32,            //file type + persmissions
     pub uid: u32,             //owner user id
@@ -44,6 +48,7 @@ pub struct Inode {
 
 //Directory Entry
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct DirEntry {
     pub inode: u32, //which inode entry this entry points to
     pub rec_len: u16,

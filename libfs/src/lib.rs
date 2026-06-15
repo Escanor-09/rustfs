@@ -1,5 +1,6 @@
 pub mod bitmap;
 pub mod disk;
+pub mod inode;
 pub mod layout;
 
 pub fn add(left: u64, right: u64) -> u64 {
