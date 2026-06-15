@@ -49,10 +49,9 @@ pub struct Inode {
 //Directory Entry
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct DirEntry {
+pub struct DirEntryHeader {
     pub inode: u32, //which inode entry this entry points to
     pub rec_len: u16,
-    pub name_len: u8,    //length of the filename
-    pub file_type: u8,   //file or directory
-    pub name: [u8; 255], //filename (up to 255 chars)
+    pub name_len: u8,  //length of the filename
+    pub file_type: u8, //file or directory
 }
