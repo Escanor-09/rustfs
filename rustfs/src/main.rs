@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{FileAttr, MountOption, ReplyAttr, Request};
 use fuser::{FileType, Filesystem};
 use libc::ENOENT;
+use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
-use libfs::layout::BLOCK_SIZE;
+use libfs::layout::{BLOCK_SIZE, FT_REGULAR};
 use libfs::{
     dir::DirStore,
     disk::Disk,
@@ -156,5 +157,139 @@ impl Filesystem for RustFS {
             }
         }
         reply.ok();
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let real_parent = if parent == 1 { 2 } else { parent };
+        let name_str = name.to_str().unwrap();
+
+        //find an open bit i.e. 0 bit
+        let inode_bitmap_block = self.superblock.inode_bitmap_block;
+        let bitmap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode_bitmap_block)
+            .unwrap();
+
+        let mut bitmap = Bitmap::from_block(bitmap_data);
+
+        let inode_num = match bitmap.alloc() {
+            Some(n) => n,
+            None => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
+        };
+
+        let update_bitmap = bitmap.to_block();
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_bitmap_block, &update_bitmap)
+            .unwrap();
+
+        //update superblock free inode count
+        self.superblock.free_inodes -= 1;
+        let mut sb_block = [0u8; 4096];
+
+        unsafe {
+            std::ptr::write(sb_block.as_mut_ptr() as *mut Superblock, self.superblock);
+        }
+
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        //after finding the inode number initialize the inode struct
+        let new_inode = Inode {
+            mode,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            hard_links: 1,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            direct: [0u64; 12],
+            indirect: 0,
+            double_indirect: 0,
+            _padding: [0u8; 96],
+        };
+
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        inode_store.write_inode(inode_num, &new_inode);
+
+        //add directory entry in parent
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+        dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR);
+
+        //reply to fuse with the new file attributes
+        let attr = self.inode_to_attr(inode_num, &new_inode);
+        reply.created(&TTL, &attr, 0, 0, 0);
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let mut inode = inode_store.read_inode(ino);
+
+        if let Some(atime) = atime {
+            inode.atime = match atime {
+                fuser::TimeOrNow::SpecificTime(t) => {
+                    t.duration_since(UNIX_EPOCH).unwrap().as_secs()
+                }
+                fuser::TimeOrNow::Now => std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            };
+        }
+
+        if let Some(mtime) = mtime {
+            inode.mtime = match mtime {
+                fuser::TimeOrNow::SpecificTime(t) => {
+                    t.duration_since(UNIX_EPOCH).unwrap().as_secs()
+                }
+                fuser::TimeOrNow::Now => std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            }
+        }
+
+        inode_store.write_inode(ino, &inode);
+        let attr = self.inode_to_attr(ino, &inode);
+        reply.attr(&TTL, &attr);
     }
 }
