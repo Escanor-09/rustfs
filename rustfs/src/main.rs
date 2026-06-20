@@ -6,7 +6,7 @@ use fuser::{FileType, Filesystem};
 use libc::{EFBIG, ENOENT, ENOSPC};
 use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
-use libfs::layout::{BLOCK_SIZE, FT_REGULAR};
+use libfs::layout::{BLOCK_SIZE, DirEntryHeader, FT_DIRECTORY, FT_REGULAR};
 use libfs::{
     dir::DirStore,
     disk::Disk,
@@ -368,6 +368,162 @@ impl Filesystem for RustFS {
 
         let data = &block[byte_offset_in_block..byte_offset_in_block + bytes_to_read];
         reply.data(data);
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+
+        let inode_bitmap_block = self.superblock.inode_bitmap_block;
+        let bitmap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode_bitmap_block)
+            .unwrap();
+
+        let mut bitmap = Bitmap::from_block(bitmap_data);
+
+        let inode_num = match bitmap.alloc() {
+            Some(n) => n,
+            None => {
+                reply.error(ENOSPC);
+                return;
+            }
+        };
+
+        //write back the updated bitmap
+        let updated_bitmap = bitmap.to_block();
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_bitmap_block, &updated_bitmap)
+            .unwrap();
+
+        self.superblock.free_inodes -= 1;
+        let mut sb_block = [0u8; 4096];
+
+        unsafe {
+            std::ptr::write(sb_block.as_mut_ptr() as *mut Superblock, self.superblock);
+        }
+
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
+
+        //allocate data block for "." and ".." entries
+        let data_bitmap_block = self.superblock.data_bitmap_block;
+        let data_bitmap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(data_bitmap_block)
+            .unwrap();
+        let mut data_bitmap = Bitmap::from_block(data_bitmap_data);
+
+        let new_block_index = match data_bitmap.alloc() {
+            Some(n) => n,
+            None => {
+                reply.error(ENOSPC);
+                return;
+            }
+        };
+
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(data_bitmap_block, &data_bitmap.to_block())
+            .unwrap();
+
+        let actual_block = self.superblock.data_start_block + new_block_index;
+
+        //write "." and ".." into that block
+        let real_parent = if parent == 1 { 2 } else { parent };
+
+        let mut dir_block = [0u8; 4096];
+
+        //"." -> points to itself (the new directory)
+        let dot_healer = DirEntryHeader {
+            inode: inode_num as u32,
+            rec_len: 12,
+            name_len: 1,
+            file_type: FT_DIRECTORY,
+        };
+
+        unsafe {
+            std::ptr::write(dir_block.as_mut_ptr() as *mut DirEntryHeader, dot_healer);
+        }
+        dir_block[8] = b'.';
+
+        //".." -> points to parent
+        let dotdot_header = DirEntryHeader {
+            inode: real_parent as u32,
+            rec_len: (BLOCK_SIZE - 12) as u16,
+            name_len: 2,
+            file_type: FT_DIRECTORY,
+        };
+
+        unsafe {
+            std::ptr::write(
+                dir_block[12..].as_mut_ptr() as *mut DirEntryHeader,
+                dotdot_header,
+            );
+        }
+        dir_block[20] = b'.';
+        dir_block[21] = b'.';
+
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(actual_block, &dir_block)
+            .unwrap();
+
+        //initialize and write the new directory's inode
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut direct = [0u64; 12];
+        direct[0] = actual_block;
+
+        let new_inode = Inode {
+            mode: mode | 0o040000,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            hard_links: 2, //"." and ".."
+            size: BLOCK_SIZE,
+            atime: now,
+            ctime: now,
+            mtime: now,
+            direct,
+            indirect: 0,
+            double_indirect: 0,
+            _padding: [0u8; 96],
+        };
+
+        inode_store.write_inode(inode_num, &new_inode);
+
+        //add entry in parent + increment parent's hard links
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+        let name_str = name.to_str().unwrap();
+        dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_DIRECTORY);
+
+        //increment parent's hard links (new ".." points to it)
+        let mut parent_inode = inode_store.read_inode(real_parent);
+        parent_inode.hard_links += 1;
+        inode_store.write_inode(real_parent, &parent_inode);
+
+        let attr = self.inode_to_attr(inode_num, &new_inode);
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn setattr(
