@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{FileAttr, MountOption, ReplyAttr, Request};
 use fuser::{FileType, Filesystem};
-use libc::ENOENT;
+use libc::{EFBIG, ENOENT, ENOSPC};
 use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
 use libfs::layout::{BLOCK_SIZE, FT_REGULAR};
@@ -241,6 +241,133 @@ impl Filesystem for RustFS {
         //reply to fuse with the new file attributes
         let attr = self.inode_to_attr(inode_num, &new_inode);
         reply.created(&TTL, &attr, 0, 0, 0);
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        //read the current inode
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let mut inode = inode_store.read_inode(ino);
+
+        //figure out which block the data goes
+        let block_index = offset as usize / BLOCK_SIZE as usize;
+        let bytes_offset_in_block = offset as usize % BLOCK_SIZE as usize;
+
+        if block_index >= 12 {
+            reply.error(EFBIG);
+            return;
+        }
+
+        //allocate data block if none exists
+        let block_num = if inode.direct[block_index] == 0 {
+            let data_bitmap_block = self.superblock.data_bitmap_block;
+            let bitmap_data = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(data_bitmap_block)
+                .unwrap();
+            let mut bitmap = Bitmap::from_block(bitmap_data);
+
+            let new_block_index = match bitmap.alloc() {
+                Some(n) => n,
+                None => {
+                    reply.error(ENOSPC);
+                    return;
+                }
+            };
+
+            self.disk
+                .lock()
+                .unwrap()
+                .write_block(data_bitmap_block, &bitmap.to_block())
+                .unwrap();
+
+            //convert bitmap index to actual disk block numer
+            let actual_block = self.superblock.data_start_block + new_block_index;
+            inode.direct[block_index] = actual_block;
+            actual_block
+        } else {
+            inode.direct[block_index]
+        };
+
+        //the block on which the data is to be written
+        let mut block = self.disk.lock().unwrap().read_block(block_num).unwrap();
+
+        let end = bytes_offset_in_block + data.len();
+        block[bytes_offset_in_block..end].copy_from_slice(data);
+
+        //write the actual bytes on the block
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(block_num, &block)
+            .unwrap();
+
+        //update the inode metadata
+        let new_size = (offset as u64 + data.len() as u64).max(inode.size);
+        inode.size = new_size;
+        inode.mtime = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        inode_store.write_inode(ino, &inode);
+
+        //reply to fuse with byte written
+        reply.written(data.len() as u32);
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyData,
+    ) {
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let inode = inode_store.read_inode(ino);
+
+        if offset as u64 >= inode.size {
+            reply.data(&[]);
+            return;
+        }
+
+        let block_index = offset as usize / BLOCK_SIZE as usize;
+        let byte_offset_in_block = offset as usize % BLOCK_SIZE as usize;
+
+        if block_index >= 12 || inode.direct[block_index] == 0 {
+            reply.data(&[]);
+            return;
+        }
+
+        let block_num = inode.direct[block_index];
+
+        let block = self.disk.lock().unwrap().read_block(block_num).unwrap();
+
+        //how many bytes can we read?? //requested size, remaining file size, remaining space in the block
+        let remaining_in_file = (inode.size - offset as u64) as usize;
+        let remaining_in_block = BLOCK_SIZE as usize - byte_offset_in_block;
+        let bytes_to_read = (size as usize)
+            .min(remaining_in_block)
+            .min(remaining_in_file);
+
+        let data = &block[byte_offset_in_block..byte_offset_in_block + bytes_to_read];
+        reply.data(data);
     }
 
     fn setattr(
