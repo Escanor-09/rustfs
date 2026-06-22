@@ -526,6 +526,82 @@ impl Filesystem for RustFS {
         reply.entry(&TTL, &attr, 0);
     }
 
+    fn unlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let real_parent = if parent == 1 { 2 } else { parent };
+        let name_str = name.to_str().unwrap();
+
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+
+        //find the inode numer using lookup
+        let inode_num = match dir_store.look_up(real_parent, name_str.to_string()) {
+            Some(n) => n as u64,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        //read that inode
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+
+        let mut inode = inode_store.read_inode(inode_num);
+
+        //decrement the hard links
+        inode.hard_links -= 1;
+
+        //if hard_links == 0:
+        //      free the data blocks
+        //      free the inode
+        if inode.hard_links == 0 {
+            for i in 0..12 {
+                if inode.direct[i] != 0 {
+                    let block_offset = inode.direct[i] - self.superblock.data_start_block;
+                    let data_bitmap_block = self.superblock.data_bitmap_block;
+                    let bitmap_data = self
+                        .disk
+                        .lock()
+                        .unwrap()
+                        .read_block(data_bitmap_block)
+                        .unwrap();
+                    let mut bitmap = Bitmap::from_block(bitmap_data);
+                    bitmap.free(block_offset);
+                    self.disk
+                        .lock()
+                        .unwrap()
+                        .write_block(data_bitmap_block, &bitmap.to_block())
+                        .unwrap();
+                }
+            }
+
+            //free the inode
+            let inode_bitmap_block = self.superblock.inode_bitmap_block;
+            let bitmap_data = self.disk.lock().unwrap().read_block(inode_num).unwrap();
+            let mut bitmap = Bitmap::from_block(bitmap_data);
+            bitmap.free(inode_num);
+            self.disk
+                .lock()
+                .unwrap()
+                .write_block(inode_bitmap_block, &bitmap.to_block())
+                .unwrap();
+        } else {
+            //hard links still > 0, just write the update inode back
+            inode_store.write_inode(inode_num, &inode);
+        }
+        //remove the directory entry
+        match dir_store.remove_entry(real_parent, name_str) {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(ENOENT),
+        }
+    }
+
     fn setattr(
         &mut self,
         _req: &Request,
