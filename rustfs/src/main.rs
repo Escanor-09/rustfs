@@ -583,7 +583,12 @@ impl Filesystem for RustFS {
 
             //free the inode
             let inode_bitmap_block = self.superblock.inode_bitmap_block;
-            let bitmap_data = self.disk.lock().unwrap().read_block(inode_num).unwrap();
+            let bitmap_data = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(inode_bitmap_block)
+                .unwrap();
             let mut bitmap = Bitmap::from_block(bitmap_data);
             bitmap.free(inode_num);
             self.disk
@@ -596,6 +601,87 @@ impl Filesystem for RustFS {
             inode_store.write_inode(inode_num, &inode);
         }
         //remove the directory entry
+        match dir_store.remove_entry(real_parent, name_str) {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(ENOENT),
+        }
+    }
+
+    fn rmdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let real_parent = if parent == 1 { 2 } else { parent };
+        let name_str = name.to_str().unwrap();
+
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+
+        let inode_num = match dir_store.look_up(real_parent, name_str.to_string()) {
+            Some(n) => n as u64,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        //read that inode
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let inode = inode_store.read_inode(inode_num);
+
+        let entries = dir_store.list(inode_num);
+        if entries.len() > 2 {
+            reply.error(libc::ENOTEMPTY);
+            return;
+        }
+
+        for i in 0..12 {
+            if inode.direct[i] != 0 {
+                let block_offset = inode.direct[i] - self.superblock.data_start_block;
+                let data_bitmap_block = self.superblock.data_bitmap_block;
+                let bitmap_data = self
+                    .disk
+                    .lock()
+                    .unwrap()
+                    .read_block(data_bitmap_block)
+                    .unwrap();
+                let mut bitmap = Bitmap::from_block(bitmap_data);
+                bitmap.free(block_offset);
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(data_bitmap_block, &bitmap.to_block())
+                    .unwrap();
+            }
+        }
+
+        //free the directory's inode
+        let inode_bitmap_block = self.superblock.inode_bitmap_block;
+        let bitmap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode_bitmap_block)
+            .unwrap();
+        let mut bitmap = Bitmap::from_block(bitmap_data);
+        bitmap.free(inode_num);
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_bitmap_block, &bitmap.to_block())
+            .unwrap();
+
+        //decrement parent's hard link
+        let mut parent_inode = inode_store.read_inode(real_parent);
+        parent_inode.hard_links -= 1;
+        inode_store.write_inode(real_parent, &parent_inode);
+
+        //remove the directory entry from the parent
         match dir_store.remove_entry(real_parent, name_str) {
             Ok(()) => reply.ok(),
             Err(_) => reply.error(ENOENT),
