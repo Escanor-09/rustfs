@@ -8,6 +8,10 @@ pub const FT_REGULAR: u8 = 1;
 pub const FT_DIRECTORY: u8 = 2;
 pub const FT_SYMLINK: u8 = 7;
 
+//for journal
+pub const JOURNAL_MAGIC: u32 = 0x4A524E4C;
+pub const MAX_JOURNAL_BLOCKS: usize = 4;
+
 //Struct of the Superblock which contains the information of all the blocks
 //#[] is an attribute syntax
 //#[repr(C)] tells the program use C- compatible memory layout for this type
@@ -54,4 +58,14 @@ pub struct DirEntryHeader {
     pub rec_len: u16,
     pub name_len: u8,  //length of the filename
     pub file_type: u8, //file or directory
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct JournalHeader {
+    pub magic: u32,
+    pub commited: u8,
+    pub num_blocks: u8,
+    pub _padding: [u8; 2],
+    pub block_numbers: [u64; 4],
 }
