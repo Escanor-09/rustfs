@@ -688,6 +688,90 @@ impl Filesystem for RustFS {
         }
     }
 
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        newparent: u64,
+        newname: &std::ffi::OsStr,
+        _flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        //same directory
+        let old_parent = if parent == 1 { 2 } else { parent };
+        let old_name = name.to_str().unwrap();
+
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+
+        let inode_num = match dir_store.look_up(old_parent, old_name.to_string()) {
+            Some(n) => n as u64,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        //read that inode
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let mut inode = inode_store.read_inode(inode_num);
+
+        let file_type = if inode.mode & 0o170000 == 0o040000 {
+            FT_DIRECTORY
+        } else {
+            FT_REGULAR
+        };
+
+        let new_parent = if newparent == 1 { 2 } else { newparent };
+        let new_name = newname.to_str().unwrap();
+
+        inode.ctime = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        inode_store.write_inode(inode_num, &inode);
+
+        dir_store.add_entry(new_parent, new_name, inode_num as u32, file_type);
+        dir_store.remove_entry(old_parent, old_name).unwrap();
+
+        if file_type == FT_DIRECTORY && old_parent != new_parent {
+            let block_num = inode.direct[0];
+            let mut block = self.disk.lock().unwrap().read_block(block_num).unwrap();
+
+            let dotdot_header = DirEntryHeader {
+                inode: new_parent as u32,
+                rec_len: (BLOCK_SIZE - 12) as u16,
+                name_len: 2,
+                file_type: FT_DIRECTORY,
+            };
+
+            unsafe {
+                std::ptr::write(
+                    block[12..].as_mut_ptr() as *mut DirEntryHeader,
+                    dotdot_header,
+                );
+            }
+            self.disk
+                .lock()
+                .unwrap()
+                .write_block(block_num, &block)
+                .unwrap();
+
+            //adjust hard links
+            let mut old_parent_inode = inode_store.read_inode(old_parent);
+            old_parent_inode.hard_links -= 1;
+            inode_store.write_inode(old_parent, &old_parent_inode);
+
+            let mut new_parent_inode = inode_store.read_inode(new_parent);
+            new_parent_inode.hard_links += 1;
+            inode_store.write_inode(new_parent, &new_parent_inode);
+        }
+        reply.ok();
+    }
+
     fn setattr(
         &mut self,
         _req: &Request,
