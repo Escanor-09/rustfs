@@ -6,7 +6,8 @@ use fuser::{FileType, Filesystem};
 use libc::{EFBIG, ENOENT, ENOSPC};
 use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
-use libfs::layout::{BLOCK_SIZE, DirEntryHeader, FT_DIRECTORY, FT_REGULAR};
+use libfs::journal::Journal;
+use libfs::layout::{BLOCK_SIZE, DirEntryHeader, FT_DIRECTORY, FT_REGULAR, INODE_SIZE};
 use libfs::{
     dir::DirStore,
     disk::Disk,
@@ -31,8 +32,13 @@ impl RustFS {
 
         assert_eq!(superblock.magic, MAGIC, "Not a rustfs filesystem!");
 
+        let disk_arc = Arc::new(Mutex::new(disk));
+
+        let mut journal = Journal::new(disk_arc.clone(), superblock.journal_start_block);
+        journal.recover();
+
         RustFS {
-            disk: Arc::new(Mutex::new(disk)),
+            disk: disk_arc,
             superblock,
         }
     }
@@ -191,22 +197,15 @@ impl Filesystem for RustFS {
             }
         };
 
-        let update_bitmap = bitmap.to_block();
-        self.disk
-            .lock()
-            .unwrap()
-            .write_block(inode_bitmap_block, &update_bitmap)
-            .unwrap();
+        let new_inode_bitmap = bitmap.to_block();
 
-        //update superblock free inode count
-        self.superblock.free_inodes -= 1;
+        let mut new_superblock = self.superblock;
+        new_superblock.free_inodes -= 1;
         let mut sb_block = [0u8; 4096];
 
         unsafe {
-            std::ptr::write(sb_block.as_mut_ptr() as *mut Superblock, self.superblock);
+            std::ptr::write(sb_block.as_mut_ptr() as *mut Superblock, new_superblock);
         }
-
-        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -228,17 +227,52 @@ impl Filesystem for RustFS {
             _padding: [0u8; 96],
         };
 
-        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
-        inode_store.write_inode(inode_num, &new_inode);
+        let inodes_per_block = BLOCK_SIZE / INODE_SIZE;
+        let inode_block_idx = self.superblock.inode_table_block + inode_num / inodes_per_block;
+        let inode_offset = ((inode_num % inodes_per_block) * INODE_SIZE) as usize;
+        let mut inode_table_block_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode_block_idx)
+            .unwrap();
 
-        //add directory entry in parent
+        unsafe {
+            std::ptr::write(
+                inode_table_block_data[inode_offset..].as_mut_ptr() as *mut Inode,
+                new_inode,
+            );
+        }
+
+        let mut journal = Journal::new(self.disk.clone(), self.superblock.journal_start_block);
+        journal.begin_transaction(&[
+            (inode_bitmap_block, new_inode_bitmap),
+            (0, sb_block),
+            (inode_block_idx, inode_table_block_data),
+        ]);
+
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_bitmap_block, &new_inode_bitmap)
+            .unwrap();
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_block_idx, &inode_table_block_data)
+            .unwrap();
+
+        self.superblock = new_superblock;
+
         let mut dir_store = DirStore::new(
             self.disk.clone(),
             InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
         );
         dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR);
 
-        //reply to fuse with the new file attributes
+        journal.commit_complete();
+
         let attr = self.inode_to_attr(inode_num, &new_inode);
         reply.created(&TTL, &attr, 0, 0, 0);
     }
