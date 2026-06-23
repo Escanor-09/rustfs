@@ -244,13 +244,25 @@ impl Filesystem for RustFS {
             );
         }
 
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+
+        let (dir_block_num, dir_block_data) =
+            dir_store.prepare_add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR);
+
         let mut journal = Journal::new(self.disk.clone(), self.superblock.journal_start_block);
         journal.begin_transaction(&[
             (inode_bitmap_block, new_inode_bitmap),
             (0, sb_block),
             (inode_block_idx, inode_table_block_data),
+            (dir_block_num, dir_block_data),
         ]);
 
+        if std::env::var("CRASH_TEST").is_ok() {
+            std::process::exit(1);
+        }
         self.disk
             .lock()
             .unwrap()
@@ -262,14 +274,18 @@ impl Filesystem for RustFS {
             .unwrap()
             .write_block(inode_block_idx, &inode_table_block_data)
             .unwrap();
-
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(dir_block_num, &dir_block_data)
+            .unwrap();
         self.superblock = new_superblock;
 
-        let mut dir_store = DirStore::new(
-            self.disk.clone(),
-            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
-        );
-        dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR);
+        // let mut dir_store = DirStore::new(
+        //     self.disk.clone(),
+        //     InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        // );
+        // dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR);
 
         journal.commit_complete();
 
