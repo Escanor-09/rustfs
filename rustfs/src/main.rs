@@ -69,6 +69,196 @@ impl RustFS {
             flags: 0,
         }
     }
+
+    fn alloc_data_block(&mut self) -> Option<u64> {
+        let data_bitmap_block = self.superblock.data_bitmap_block;
+        let bitmap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(data_bitmap_block)
+            .unwrap();
+        let mut bitmap = Bitmap::from_block(bitmap_data);
+        let new_block_index = bitmap.alloc()?;
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(data_bitmap_block, &bitmap.to_block())
+            .unwrap();
+        Some(self.superblock.data_start_block + new_block_index)
+    }
+
+    fn get_or_alloc_block(&mut self, inode: &mut Inode, block_index: usize) -> Option<u64> {
+        if block_index < 12 {
+            //DIRECT
+
+            if inode.direct[block_index] == 0 {
+                inode.direct[block_index] = self.alloc_data_block()?;
+            }
+            Some(inode.direct[block_index])
+        } else if block_index < 12 + 512 {
+            //SINGLE INDIRECT
+            let indirect_index = block_index - 12;
+
+            if inode.indirect == 0 {
+                inode.indirect = self.alloc_data_block()?;
+
+                let zero_block = [0u8; 4096];
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(inode.indirect, &zero_block)
+                    .unwrap();
+            }
+
+            let mut indirect_block = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(inode.indirect)
+                .unwrap();
+            let ptrs = unsafe {
+                std::slice::from_raw_parts_mut(indirect_block.as_mut_ptr() as *mut u64, 512)
+            };
+
+            if ptrs[indirect_index] == 0 {
+                ptrs[indirect_index] = self.alloc_data_block()?;
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(inode.indirect, &indirect_block)
+                    .unwrap();
+            }
+            Some(ptrs[indirect_index])
+        } else if block_index < 12 + 512 + 512 * 512 {
+            //DOUBLE INDIRECT
+            let di_index = block_index - 12 - 512;
+            let outer_index = di_index / 512;
+            let inner_index = di_index % 512;
+
+            if inode.double_indirect == 0 {
+                inode.double_indirect = self.alloc_data_block()?;
+                let zero_block = [0u8; 4096];
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(inode.double_indirect, &zero_block)
+                    .unwrap();
+            }
+
+            let mut outer_block = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(inode.double_indirect)
+                .unwrap();
+            let outer_ptrs = unsafe {
+                std::slice::from_raw_parts_mut(outer_block.as_mut_ptr() as *mut u64, 512)
+            };
+
+            if outer_ptrs[outer_index] == 0 {
+                outer_ptrs[outer_index] = self.alloc_data_block()?;
+                let zero_block = [0u8; 4096];
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(outer_ptrs[outer_index], &zero_block)
+                    .unwrap();
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(inode.double_indirect, &outer_block)
+                    .unwrap();
+            }
+
+            let inner_block_num = outer_ptrs[outer_index];
+            let mut inner_block = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(inner_block_num)
+                .unwrap();
+            let inner_ptrs = unsafe {
+                std::slice::from_raw_parts_mut(inner_block.as_mut_ptr() as *mut u64, 512)
+            };
+
+            if inner_ptrs[inner_index] == 0 {
+                inner_ptrs[inner_index] = self.alloc_data_block()?;
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .write_block(inner_block_num, &inner_block)
+                    .unwrap();
+            }
+
+            Some(inner_ptrs[inner_index])
+        } else {
+            None
+        }
+    }
+
+    fn get_block_readonly(&mut self, inode: &Inode, block_index: usize) -> Option<u64> {
+        if block_index < 12 {
+            if inode.direct[block_index] == 0 {
+                return None;
+            }
+            Some(inode.direct[block_index])
+        } else if block_index < 12 + 512 {
+            if inode.indirect == 0 {
+                return None;
+            }
+            let indirect_block = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(inode.indirect)
+                .unwrap();
+            let ptrs =
+                unsafe { std::slice::from_raw_parts(indirect_block.as_ptr() as *const u64, 512) };
+            let idx = block_index - 12;
+            if ptrs[idx] == 0 {
+                return None;
+            }
+            Some(ptrs[idx])
+        } else if block_index < 12 + 512 + 512 * 512 {
+            if inode.double_indirect == 0 {
+                return None;
+            }
+
+            let di_index = block_index - 12 - 512;
+            let outer_index = di_index / 512;
+            let inner_index = di_index % 512;
+
+            let outer_block = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(inode.double_indirect)
+                .unwrap();
+            let outer_ptrs =
+                unsafe { std::slice::from_raw_parts(outer_block.as_ptr() as *const u64, 512) };
+
+            if outer_ptrs[outer_index] == 0 {
+                return None;
+            }
+
+            let inner_block = self
+                .disk
+                .lock()
+                .unwrap()
+                .read_block(outer_ptrs[outer_index])
+                .unwrap();
+            let inner_ptrs =
+                unsafe { std::slice::from_raw_parts(inner_block.as_ptr() as *const u64, 512) };
+
+            if inner_ptrs[inner_index] == 0 {
+                return None;
+            }
+            Some(inner_ptrs[inner_index])
+        } else {
+            None
+        }
+    }
 }
 
 fn main() {
@@ -313,68 +503,31 @@ impl Filesystem for RustFS {
         let block_index = offset as usize / BLOCK_SIZE as usize;
         let bytes_offset_in_block = offset as usize % BLOCK_SIZE as usize;
 
-        if block_index >= 12 {
-            reply.error(EFBIG);
-            return;
-        }
-
-        //allocate data block if none exists
-        let block_num = if inode.direct[block_index] == 0 {
-            let data_bitmap_block = self.superblock.data_bitmap_block;
-            let bitmap_data = self
-                .disk
-                .lock()
-                .unwrap()
-                .read_block(data_bitmap_block)
-                .unwrap();
-            let mut bitmap = Bitmap::from_block(bitmap_data);
-
-            let new_block_index = match bitmap.alloc() {
-                Some(n) => n,
-                None => {
-                    reply.error(ENOSPC);
-                    return;
-                }
-            };
-
-            self.disk
-                .lock()
-                .unwrap()
-                .write_block(data_bitmap_block, &bitmap.to_block())
-                .unwrap();
-
-            //convert bitmap index to actual disk block numer
-            let actual_block = self.superblock.data_start_block + new_block_index;
-            inode.direct[block_index] = actual_block;
-            actual_block
-        } else {
-            inode.direct[block_index]
+        let block_num = match self.get_or_alloc_block(&mut inode, block_index) {
+            Some(n) => n,
+            None => {
+                reply.error(EFBIG);
+                return;
+            }
         };
 
-        //the block on which the data is to be written
         let mut block = self.disk.lock().unwrap().read_block(block_num).unwrap();
-
         let end = bytes_offset_in_block + data.len();
         block[bytes_offset_in_block..end].copy_from_slice(data);
-
-        //write the actual bytes on the block
         self.disk
             .lock()
             .unwrap()
             .write_block(block_num, &block)
             .unwrap();
 
-        //update the inode metadata
         let new_size = (offset as u64 + data.len() as u64).max(inode.size);
         inode.size = new_size;
         inode.mtime = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-
         inode_store.write_inode(ino, &inode);
 
-        //reply to fuse with byte written
         reply.written(data.len() as u32);
     }
 
@@ -397,27 +550,30 @@ impl Filesystem for RustFS {
             return;
         }
 
-        let block_index = offset as usize / BLOCK_SIZE as usize;
-        let byte_offset_in_block = offset as usize % BLOCK_SIZE as usize;
+        let mut result = Vec::with_capacity(size as usize);
+        let mut current_offset = offset as u64;
+        let end_offset = (offset as u64 + size as u64).min(inode.size);
 
-        if block_index >= 12 || inode.direct[block_index] == 0 {
-            reply.data(&[]);
-            return;
+        while current_offset < end_offset {
+            let block_index = (current_offset / BLOCK_SIZE) as usize;
+            let byte_offset_in_block = (current_offset % BLOCK_SIZE) as usize;
+
+            let block_num = match self.get_block_readonly(&inode, block_index) {
+                Some(n) => n,
+                None => break,
+            };
+
+            let block = self.disk.lock().unwrap().read_block(block_num).unwrap();
+
+            let remaining_in_block = BLOCK_SIZE as usize - byte_offset_in_block;
+            let remainig_needed = (end_offset - current_offset) as usize;
+            let chunk_size = remaining_in_block.min(remainig_needed);
+
+            result
+                .extend_from_slice(&block[byte_offset_in_block..byte_offset_in_block + chunk_size]);
+            current_offset += chunk_size as u64;
         }
-
-        let block_num = inode.direct[block_index];
-
-        let block = self.disk.lock().unwrap().read_block(block_num).unwrap();
-
-        //how many bytes can we read?? //requested size, remaining file size, remaining space in the block
-        let remaining_in_file = (inode.size - offset as u64) as usize;
-        let remaining_in_block = BLOCK_SIZE as usize - byte_offset_in_block;
-        let bytes_to_read = (size as usize)
-            .min(remaining_in_block)
-            .min(remaining_in_file);
-
-        let data = &block[byte_offset_in_block..byte_offset_in_block + bytes_to_read];
-        reply.data(data);
+        reply.data(&result);
     }
 
     fn mkdir(
