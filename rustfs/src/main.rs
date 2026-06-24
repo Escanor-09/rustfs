@@ -1102,6 +1102,55 @@ impl Filesystem for RustFS {
     ) {
         let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
         let mut inode = inode_store.read_inode(ino);
+        let mut changed = false;
+
+        //changing mod chmod
+        if let Some(mode) = _mode {
+            inode.mode = (inode.mode & 0o170000) | (mode & 0o007777);
+            changed = true;
+        }
+
+        //changing _uid/_gid -chown
+        if let Some(uid) = _uid {
+            inode.uid = uid;
+            changed = true;
+        }
+
+        if let Some(gid) = _gid {
+            inode.gid = gid;
+            changed = true;
+        }
+
+        if let Some(size) = _size {
+            if size < inode.size {
+                let old_blocks_needed = ((inode.size + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize;
+                let new_blocks_needed = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize;
+
+                for block_idx in new_blocks_needed..old_blocks_needed {
+                    if block_idx < 12 && inode.direct[block_idx] != 0 {
+                        let block_offset =
+                            inode.direct[block_idx] - self.superblock.data_start_block;
+                        let data_bitmap_block = self.superblock.data_bitmap_block;
+                        let bitmap_data = self
+                            .disk
+                            .lock()
+                            .unwrap()
+                            .read_block(data_bitmap_block)
+                            .unwrap();
+                        let mut bitmap = Bitmap::from_block(bitmap_data);
+                        bitmap.free(block_offset);
+                        self.disk
+                            .lock()
+                            .unwrap()
+                            .write_block(data_bitmap_block, &bitmap.to_block())
+                            .unwrap();
+                        inode.direct[block_idx] = 0;
+                    }
+                }
+            }
+            inode.size = size;
+            changed = true;
+        }
 
         if let Some(atime) = atime {
             inode.atime = match atime {
@@ -1113,6 +1162,7 @@ impl Filesystem for RustFS {
                     .unwrap()
                     .as_secs(),
             };
+            changed = true;
         }
 
         if let Some(mtime) = mtime {
@@ -1124,9 +1174,16 @@ impl Filesystem for RustFS {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-            }
+            };
+            changed = true;
         }
 
+        if changed {
+            inode.ctime = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+        }
         inode_store.write_inode(ino, &inode);
         let attr = self.inode_to_attr(ino, &inode);
         reply.attr(&TTL, &attr);
