@@ -7,7 +7,7 @@ use libc::{EFBIG, ENOENT, ENOSPC};
 use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
 use libfs::journal::Journal;
-use libfs::layout::{BLOCK_SIZE, DirEntryHeader, FT_DIRECTORY, FT_REGULAR, INODE_SIZE};
+use libfs::layout::{BLOCK_SIZE, DirEntryHeader, FT_DIRECTORY, FT_REGULAR, FT_SYMLINK, INODE_SIZE};
 use libfs::{
     dir::DirStore,
     disk::Disk,
@@ -47,6 +47,8 @@ impl RustFS {
     fn inode_to_attr(&self, ino: u64, inode: &Inode) -> FileAttr {
         let kind = if inode.mode & 0o170000 == 0o040000 {
             FileType::Directory
+        } else if inode.mode & 0o170000 == 0o120000 {
+            FileType::Symlink
         } else {
             FileType::RegularFile
         };
@@ -976,6 +978,108 @@ impl Filesystem for RustFS {
             inode_store.write_inode(new_parent, &new_parent_inode);
         }
         reply.ok();
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        link_name: &std::ffi::OsStr,
+        target: &std::path::Path,
+        reply: fuser::ReplyEntry,
+    ) {
+        let real_parent = if parent == 1 { 2 } else { parent };
+        let name_str = link_name.to_str().unwrap();
+        let target_path = target.to_str().unwrap();
+
+        //allocate inode
+        let inode_bitmap_block = self.superblock.inode_bitmap_block;
+        let bimtap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode_bitmap_block)
+            .unwrap();
+        let mut bitmap = Bitmap::from_block(bimtap_data);
+        let inode_num = match bitmap.alloc() {
+            Some(n) => n,
+            None => {
+                reply.error(ENOSPC);
+                return;
+            }
+        };
+
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_bitmap_block, &bitmap.to_block())
+            .unwrap();
+
+        self.superblock.free_inodes -= 1;
+        let mut sb_block = [0u8; 4096];
+        unsafe {
+            std::ptr::write(sb_block.as_mut_ptr() as *mut Superblock, self.superblock);
+        }
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
+
+        //allocate data block for the target path string
+        let target_block = self.alloc_data_block().unwrap();
+        let mut path_block = [0u8; 4096];
+        let path_bytes = target_path.as_bytes();
+        path_block[..path_bytes.len()].copy_from_slice(path_bytes);
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(target_block, &path_block)
+            .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut direct = [0u64; 12];
+        direct[0] = target_block;
+
+        let new_inode = Inode {
+            mode: 0o120777,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            hard_links: 1,
+            size: path_bytes.len() as u64,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            direct,
+            indirect: 0,
+            double_indirect: 0,
+            _padding: [0u8; 96],
+        };
+
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        inode_store.write_inode(inode_num, &new_inode);
+
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+        dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_SYMLINK);
+
+        let attr = self.inode_to_attr(inode_num, &new_inode);
+        reply.entry(&TTL, &attr, 0);
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyData) {
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let inode = inode_store.read_inode(ino);
+
+        let block = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode.direct[0])
+            .unwrap();
+        let path_bytes = &block[..inode.size as usize];
+        reply.data(path_bytes);
     }
 
     fn setattr(
