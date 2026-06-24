@@ -1082,6 +1082,39 @@ impl Filesystem for RustFS {
         reply.data(path_bytes);
     }
 
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        let real_newparent = if newparent == 1 { 2 } else { newparent };
+        let new_name = newname.to_str().unwrap();
+
+        let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
+        let mut inode = inode_store.read_inode(ino);
+
+        inode.hard_links += 1;
+        inode.ctime = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        inode_store.write_inode(ino, &inode);
+
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+
+        dir_store.add_entry(real_newparent, new_name, ino as u32, FT_REGULAR);
+
+        let attr = self.inode_to_attr(ino, &inode);
+        reply.entry(&TTL, &attr, 0);
+    }
+
     fn setattr(
         &mut self,
         _req: &Request,
