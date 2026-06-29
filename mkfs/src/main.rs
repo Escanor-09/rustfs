@@ -130,5 +130,6 @@ fn main() {
 
     disk.write_block(data_start, &dir_block).unwrap();
     println!("Wrote root directory block");
+    disk.flush_all();
     println!("mkfs complete! filesystem ready at {}", path);
 }

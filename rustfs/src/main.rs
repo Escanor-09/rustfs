@@ -27,9 +27,10 @@ impl RustFS {
 
         //read superblock from block 0
         let sb_block = disk.read_block(0).unwrap();
+        println!("DEBUG first 16 bytes: {:?}", &sb_block[0..16]);
         let superblock: Superblock =
             unsafe { std::ptr::read(sb_block.as_ptr() as *const Superblock) };
-
+        // println!("DEBUG superblock.magic = {:#x}", superblock.magic);
         assert_eq!(superblock.magic, MAGIC, "Not a rustfs filesystem!");
 
         let disk_arc = Arc::new(Mutex::new(disk));
@@ -1113,6 +1114,10 @@ impl Filesystem for RustFS {
 
         let attr = self.inode_to_attr(ino, &inode);
         reply.entry(&TTL, &attr, 0);
+    }
+
+    fn destroy(&mut self) {
+        self.disk.lock().unwrap().flush_all();
     }
 
     fn setattr(

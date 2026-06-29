@@ -60,6 +60,7 @@ impl Journal {
                 .write_block(journal_block, data)
                 .unwrap();
         }
+        self.disk.lock().unwrap().flush_all();
     }
 
     //clear the journal after real writes
