@@ -36,4 +36,10 @@ impl Bitmap {
         let bit_index = (n % 8) as usize;
         self.data[byte_index] &= !(1u8 << bit_index);
     }
+
+    pub fn is_used(&self, n: u64) -> bool {
+        let byte_index = (n / 8) as usize;
+        let bit_index = (n % 8) as usize;
+        (self.data[byte_index] >> bit_index) & 1 == 1
+    }
 }
