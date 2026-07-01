@@ -209,6 +209,43 @@ fn main() {
 
     println!("--rustfsck: checking {}--", path);
 
+    println!(
+        "magic               {}",
+        std::mem::offset_of!(Superblock, magic)
+    );
+    println!(
+        "block_size          {}",
+        std::mem::offset_of!(Superblock, block_size)
+    );
+    println!(
+        "total_blocks        {}",
+        std::mem::offset_of!(Superblock, total_blocks)
+    );
+    println!(
+        "total_inodes        {}",
+        std::mem::offset_of!(Superblock, total_inodes)
+    );
+    println!(
+        "free_blocks         {}",
+        std::mem::offset_of!(Superblock, free_blocks)
+    );
+    println!(
+        "free_inodes         {}",
+        std::mem::offset_of!(Superblock, free_inodes)
+    );
+    println!(
+        "inode_bitmap_block  {}",
+        std::mem::offset_of!(Superblock, inode_bitmap_block)
+    );
+    println!(
+        "data_bitmap_block   {}",
+        std::mem::offset_of!(Superblock, data_bitmap_block)
+    );
+    println!(
+        "inode_table_block   {}",
+        std::mem::offset_of!(Superblock, inode_table_block)
+    );
+
     if superblock.magic != MAGIC {
         println!("FATAL: invalid magic number. Aborting");
         std::process::exit(1);
