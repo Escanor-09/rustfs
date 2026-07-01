@@ -29,7 +29,7 @@ fn main() {
         total_blocks,
         total_inodes,
         free_blocks: total_data_blocks - 1, //-1 for root dir block
-        free_inodes: total_inodes - 1,      //-1 for root inode
+        free_inodes: total_inodes - 3,      //-1 for root inode
         inode_bitmap_block,
         data_bitmap_block,
         inode_table_block,

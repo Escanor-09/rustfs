@@ -11,19 +11,43 @@ use libfs::{
     layout::{BLOCK_SIZE, Inode, MAGIC, ROOT_INODE, Superblock},
 };
 
-fn collect_blocks(inode: &Inode, disk: &Arc<Mutex<Disk>>, refrenced_blocks: &mut HashSet<u64>) {
+fn collect_blocks(
+    inode: &Inode,
+    inode_num: u64,
+    disk: &Arc<Mutex<Disk>>,
+    block_owner: &mut HashMap<u64, Vec<u64>>,
+    data_start_block: u64,
+    total_blocks: u64,
+    errors: &mut u32,
+) {
     const PTRS_PER_BLOCK: usize = (BLOCK_SIZE as usize) / std::mem::size_of::<u64>();
+
+    let mut record_block = |block: u64| {
+        if block == 0 {
+            return;
+        }
+
+        //Invalid block pointer
+        if block < data_start_block || block >= total_blocks {
+            println!(
+                "INVALID BLOCK POINTER: inode {} points to block {}",
+                inode_num, block
+            );
+            *errors += 1;
+            return;
+        }
+
+        block_owner.entry(block).or_default().push(inode_num);
+    };
 
     //Direct Blocks
     for &block in &inode.direct {
-        if block != 0 {
-            refrenced_blocks.insert(block);
-        }
+        record_block(block);
     }
 
-    //Single Indirect
+    //Single indirect
     if inode.indirect != 0 {
-        refrenced_blocks.insert(inode.indirect);
+        record_block(inode.indirect);
 
         let indirect_block = disk.lock().unwrap().read_block(inode.indirect).unwrap();
 
@@ -32,16 +56,13 @@ fn collect_blocks(inode: &Inode, disk: &Arc<Mutex<Disk>>, refrenced_blocks: &mut
         };
 
         for &block in ptrs {
-            if block != 0 {
-                refrenced_blocks.insert(block);
-            }
+            record_block(block);
         }
     }
 
-    //Double Indirect
+    //Double indrect
     if inode.double_indirect != 0 {
-        //outer pointer block
-        refrenced_blocks.insert(inode.double_indirect);
+        record_block(inode.double_indirect);
 
         let outer_block = disk
             .lock()
@@ -58,18 +79,16 @@ fn collect_blocks(inode: &Inode, disk: &Arc<Mutex<Disk>>, refrenced_blocks: &mut
                 continue;
             }
 
-            //inner indirect block
-            refrenced_blocks.insert(inner_block);
+            record_block(inner_block);
 
-            let inner = disk.lock().unwrap().read_block(inner_block).unwrap();
+            let inner_block_data = disk.lock().unwrap().read_block(inner_block).unwrap();
 
-            let inner_ptrs =
-                unsafe { std::slice::from_raw_parts(inner.as_ptr() as *const u64, PTRS_PER_BLOCK) };
+            let inner_ptrs = unsafe {
+                std::slice::from_raw_parts(inner_block_data.as_ptr() as *const u64, PTRS_PER_BLOCK)
+            };
 
             for &data_block in inner_ptrs {
-                if data_block != 0 {
-                    refrenced_blocks.insert(data_block);
-                }
+                record_block(data_block);
             }
         }
     }
@@ -77,14 +96,19 @@ fn collect_blocks(inode: &Inode, disk: &Arc<Mutex<Disk>>, refrenced_blocks: &mut
 
 fn walk_directory(
     dir_inode_num: u64,
+    parent_inode_num: u64,
     dir_store: &mut DirStore,
     inode_store: &mut InodeStore,
     disk: &Arc<Mutex<Disk>>,
     refrenced_inodes: &mut HashSet<u64>,
     link_counts: &mut HashMap<u64, u32>,
     subdir_counts: &mut HashMap<u64, u32>,
-    refrenced_blocks: &mut HashSet<u64>,
+    block_owner: &mut HashMap<u64, Vec<u64>>,
     visited_dirs: &mut HashSet<u64>,
+    collected_inodes: &mut HashSet<u64>,
+    data_start_block: u64,
+    total_blocks: u64,
+    errors: &mut u32,
 ) {
     if visited_dirs.contains(&dir_inode_num) {
         println!(
@@ -96,37 +120,79 @@ fn walk_directory(
     visited_dirs.insert(dir_inode_num);
 
     let current_inode = inode_store.read_inode(dir_inode_num);
-    collect_blocks(&current_inode, disk, refrenced_blocks);
+    if collected_inodes.insert(dir_inode_num) {
+        collect_blocks(
+            &current_inode,
+            dir_inode_num,
+            disk,
+            block_owner,
+            data_start_block,
+            total_blocks,
+            errors,
+        );
+    }
 
     let entries = dir_store.list(dir_inode_num);
 
     for (inode_num, name) in entries {
         let inode_num = inode_num as u64;
 
-        if name == "." || name == ".." {
+        if name == "." {
+            if inode_num != dir_inode_num {
+                println!(
+                    "CORRUPTED DIRECTORY: '.' in inode {} points to inode {}",
+                    dir_inode_num, inode_num
+                );
+                *errors += 1;
+            }
             continue;
         }
 
+        if name == ".." {
+            if inode_num != parent_inode_num {
+                println!(
+                    "CORRUPTED DIRECTORY: '..' in inode {} points to inode {} instead of {}",
+                    dir_inode_num, inode_num, parent_inode_num
+                );
+                *errors += 1;
+            }
+            continue;
+        }
         refrenced_inodes.insert(inode_num);
         *link_counts.entry(inode_num).or_insert(0) += 1;
 
         let inode = inode_store.read_inode(inode_num);
 
-        collect_blocks(&inode, disk, refrenced_blocks);
+        if collected_inodes.insert(inode_num) {
+            collect_blocks(
+                &inode,
+                inode_num,
+                disk,
+                block_owner,
+                data_start_block,
+                total_blocks,
+                errors,
+            );
+        }
 
         let is_dir = inode.mode & 0o170000 == 0o040000;
         if is_dir {
             *subdir_counts.entry(dir_inode_num).or_insert(0) += 1;
             walk_directory(
                 inode_num,
+                dir_inode_num,
                 dir_store,
                 inode_store,
                 disk,
                 refrenced_inodes,
                 link_counts,
                 subdir_counts,
-                refrenced_blocks,
+                block_owner,
                 visited_dirs,
+                collected_inodes,
+                data_start_block,
+                total_blocks,
+                errors,
             );
         }
     }
@@ -171,13 +237,16 @@ fn main() {
 
     let mut refrenced_inodes = HashSet::new();
     let mut link_counts = HashMap::new();
-    let mut refrenced_blocks = HashSet::new();
+    let mut block_owner = HashMap::new();
     let mut visited_dirs = HashSet::new();
     let mut subdir_counts = HashMap::new();
+    let mut collected_inodes = HashSet::new();
 
     refrenced_inodes.insert(ROOT_INODE as u64);
+    let mut errors = 0;
 
     walk_directory(
+        ROOT_INODE as u64,
         ROOT_INODE as u64,
         &mut dir_store,
         &mut inode_store,
@@ -185,12 +254,29 @@ fn main() {
         &mut refrenced_inodes,
         &mut link_counts,
         &mut subdir_counts,
-        &mut refrenced_blocks,
+        &mut block_owner,
         &mut visited_dirs,
+        &mut collected_inodes,
+        superblock.data_start_block,
+        superblock.total_blocks,
+        &mut errors,
     );
 
+    println!("\n=== Checking duplicate block allocation ===");
+
+    for (block, owners) in &block_owner {
+        if owners.len() > 1 {
+            println!(
+                "DUPLICATE BLOCK {} refrenced by {} inodes {:?}",
+                block,
+                owners.len(),
+                owners
+            );
+            errors += 1;
+        }
+    }
+
     println!("\n=== checking inode bitmap consitency ===");
-    let mut errors = 0;
 
     let inode_bitmap_data = disk_arc
         .lock()
@@ -219,6 +305,40 @@ fn main() {
             println!(
                 "ORPHANED INODE: {} marked used in bitmap but not reachable from root",
                 inode_num
+            );
+            errors += 1;
+        }
+    }
+
+    println!("\n === checking data bimtap consistency");
+
+    let data_bitmap_data = disk_arc
+        .lock()
+        .unwrap()
+        .read_block(superblock.data_bitmap_block)
+        .unwrap();
+
+    let data_bitmap = Bitmap::from_block(data_bitmap_data);
+
+    let total_data_blocks = superblock.total_blocks - superblock.data_start_block;
+
+    for i in 0..total_data_blocks {
+        let actual_block = superblock.data_start_block + i;
+        let bitmap_used = data_bitmap.is_used(i);
+        let actually_used = block_owner.contains_key(&actual_block);
+
+        if bitmap_used && !actually_used {
+            println!(
+                "LEAKED BLOCK: {} marked used in bitmap but unreachable",
+                actual_block
+            );
+            errors += 1;
+        }
+
+        if !bitmap_used && actually_used {
+            println!(
+                "CORRUPTION: block {} refrenced but bimtap says FREE",
+                actual_block
             );
             errors += 1;
         }
@@ -256,6 +376,42 @@ fn main() {
             );
             errors += 1;
         }
+    }
+
+    println!("\n=== Checking superblock ===");
+
+    let mut actual_used_blocks_bitmap = 0u64;
+    for i in 0..total_data_blocks {
+        if data_bitmap.is_used(i) {
+            actual_used_blocks_bitmap += 1;
+        }
+    }
+
+    let actual_free_blocks = total_data_blocks - actual_used_blocks_bitmap;
+
+    if actual_free_blocks != superblock.free_blocks {
+        println!(
+            "SUPERBLOCK ERROR: free_blocks={}, expected {}",
+            superblock.free_blocks, actual_free_blocks
+        );
+        errors += 1;
+    }
+
+    let mut actual_used_inodes_bitmap = 0u64;
+    for i in 0..superblock.total_inodes {
+        if inode_bitmap.is_used(i) {
+            actual_used_inodes_bitmap += 1;
+        }
+    }
+
+    let actual_free_inodes = superblock.total_inodes - actual_used_inodes_bitmap;
+
+    if actual_free_inodes != superblock.free_inodes {
+        println!(
+            "SUPERBLOCK ERROR: free_inodes={}, expected {}",
+            superblock.free_inodes, actual_free_inodes
+        );
+        errors += 1;
     }
 
     println!("\n=== Summary ===");

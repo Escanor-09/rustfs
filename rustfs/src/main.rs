@@ -83,11 +83,27 @@ impl RustFS {
             .unwrap();
         let mut bitmap = Bitmap::from_block(bitmap_data);
         let new_block_index = bitmap.alloc()?;
+
+        self.superblock.free_blocks -= 1;
+
         self.disk
             .lock()
             .unwrap()
             .write_block(data_bitmap_block, &bitmap.to_block())
             .unwrap();
+
+        let sb_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&self.superblock as *const Superblock) as *const u8,
+                std::mem::size_of::<Superblock>(),
+            )
+        };
+
+        let mut sb_block = [0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
+
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
+
         Some(self.superblock.data_start_block + new_block_index)
     }
 
@@ -261,6 +277,202 @@ impl RustFS {
         } else {
             None
         }
+    }
+
+    fn free_data_block(&mut self, block_num: u64) {
+        //free one data block in the bitmap
+
+        if block_num == 0 {
+            return;
+        }
+        //Read the data bitmap
+        let bitmap_block = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(self.superblock.data_bitmap_block)
+            .unwrap();
+
+        let mut bitmap = Bitmap::from_block(bitmap_block);
+
+        //Mark block as free in bitmap
+        bitmap.free(block_num - self.superblock.data_start_block);
+
+        let updated_bitmap_block = bitmap.to_block();
+
+        //write update bitmap back
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(self.superblock.data_bitmap_block, &updated_bitmap_block)
+            .unwrap();
+
+        //update superblock
+        self.superblock.free_blocks += 1;
+
+        let sb_bytes = unsafe {
+            {
+                std::slice::from_raw_parts(
+                    (&self.superblock as *const Superblock) as *const u8,
+                    std::mem::size_of::<Superblock>(),
+                )
+            }
+        };
+
+        let mut sb_block = [0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
+
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap()
+    }
+
+    fn free_indirect_entry(&mut self, inode: &mut Inode, indirect_index: usize) {
+        const PTRS_PER_BLOCK: usize = (BLOCK_SIZE as usize) / std::mem::size_of::<u64>();
+
+        let mut indirect_block = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode.indirect)
+            .unwrap();
+
+        let ptrs = unsafe {
+            std::slice::from_raw_parts_mut(indirect_block.as_mut_ptr() as *mut u64, PTRS_PER_BLOCK)
+        };
+
+        let data_block = ptrs[indirect_index];
+
+        if data_block == 0 {
+            return;
+        }
+
+        self.free_data_block(data_block);
+
+        ptrs[indirect_index] = 0;
+
+        if ptrs.iter().all(|&b| b == 0) {
+            self.free_data_block(inode.indirect);
+            inode.indirect = 0;
+        } else {
+            self.disk
+                .lock()
+                .unwrap()
+                .write_block(inode.indirect, &indirect_block)
+                .unwrap();
+        }
+    }
+
+    fn free_double_indirect_entry(
+        &mut self,
+        inode: &mut Inode,
+        outer_index: usize,
+        inner_index: usize,
+    ) {
+        const PTRS_PER_BLOCK: usize = (BLOCK_SIZE as usize) / std::mem::size_of::<u64>();
+
+        let mut outer_block = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode.double_indirect)
+            .unwrap();
+
+        let outer_ptrs = unsafe {
+            std::slice::from_raw_parts_mut(outer_block.as_mut_ptr() as *mut u64, PTRS_PER_BLOCK)
+        };
+
+        let inner_block_num = outer_ptrs[outer_index];
+
+        if inner_block_num == 0 {
+            return;
+        }
+
+        //read the inner indirect block
+        let mut inner_block = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inner_block_num)
+            .unwrap();
+
+        let inner_ptrs = unsafe {
+            std::slice::from_raw_parts_mut(inner_block.as_mut_ptr() as *mut u64, PTRS_PER_BLOCK)
+        };
+
+        let data_block = inner_ptrs[inner_index];
+
+        if data_block == 0 {
+            return;
+        }
+
+        self.free_data_block(data_block);
+
+        inner_ptrs[inner_index] = 0;
+
+        //remove its pointer
+        if inner_ptrs.iter().all(|&b| b == 0) {
+            self.free_data_block(inner_block_num);
+
+            //remove it from the outer block
+            outer_ptrs[outer_index] = 0;
+        } else {
+            self.disk
+                .lock()
+                .unwrap()
+                .write_block(inner_block_num, &inner_block)
+                .unwrap();
+        }
+
+        //is the outer block empty
+        if outer_ptrs.iter().all(|&b| b == 0) {
+            self.free_data_block(inode.double_indirect);
+            inode.double_indirect = 0;
+        } else {
+            self.disk
+                .lock()
+                .unwrap()
+                .write_block(inode.double_indirect, &outer_block)
+                .unwrap();
+        }
+    }
+
+    fn truncate_inode(&mut self, inode: &mut Inode, new_size: u64) {
+        const PTRS_PER_BLOCK: usize = (BLOCK_SIZE as usize) / std::mem::size_of::<u64>();
+        //Determine old/new block counts
+        let old_blocks = ((inode.size + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize;
+        let new_blocks = ((new_size + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize;
+
+        //Free direct blocks beyond new size
+        if new_blocks >= old_blocks {
+            inode.size = new_size;
+            return;
+        }
+
+        for logical_block in (new_blocks..old_blocks).rev() {
+            if logical_block < 12 {
+                let block = inode.direct[logical_block];
+
+                if block != 0 {
+                    self.free_data_block(block);
+                    inode.direct[logical_block] = 0;
+                }
+            } else if logical_block < 12 + PTRS_PER_BLOCK {
+                let indirect_index = logical_block - 12;
+
+                self.free_indirect_entry(inode, indirect_index);
+            } else {
+                let remaining = logical_block - 12 - PTRS_PER_BLOCK;
+
+                let outer_index = remaining / PTRS_PER_BLOCK;
+                let inner_index = remaining % PTRS_PER_BLOCK;
+
+                self.free_double_indirect_entry(inode, outer_index, inner_index);
+            }
+        }
+
+        inode.size = new_size;
+        //If needed free indirect
+        //If needed free double indirect
+        //Update inode.size
     }
 }
 
@@ -625,31 +837,13 @@ impl Filesystem for RustFS {
 
         self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
 
-        //allocate data block for "." and ".." entries
-        let data_bitmap_block = self.superblock.data_bitmap_block;
-        let data_bitmap_data = self
-            .disk
-            .lock()
-            .unwrap()
-            .read_block(data_bitmap_block)
-            .unwrap();
-        let mut data_bitmap = Bitmap::from_block(data_bitmap_data);
-
-        let new_block_index = match data_bitmap.alloc() {
-            Some(n) => n,
+        let actual_block = match self.alloc_data_block() {
+            Some(block) => block,
             None => {
                 reply.error(ENOSPC);
                 return;
             }
         };
-
-        self.disk
-            .lock()
-            .unwrap()
-            .write_block(data_bitmap_block, &data_bitmap.to_block())
-            .unwrap();
-
-        let actual_block = self.superblock.data_start_block + new_block_index;
 
         //write "." and ".." into that block
         let real_parent = if parent == 1 { 2 } else { parent };
@@ -770,41 +964,40 @@ impl Filesystem for RustFS {
         //      free the data blocks
         //      free the inode
         if inode.hard_links == 0 {
-            for i in 0..12 {
-                if inode.direct[i] != 0 {
-                    let block_offset = inode.direct[i] - self.superblock.data_start_block;
-                    let data_bitmap_block = self.superblock.data_bitmap_block;
-                    let bitmap_data = self
-                        .disk
-                        .lock()
-                        .unwrap()
-                        .read_block(data_bitmap_block)
-                        .unwrap();
-                    let mut bitmap = Bitmap::from_block(bitmap_data);
-                    bitmap.free(block_offset);
-                    self.disk
-                        .lock()
-                        .unwrap()
-                        .write_block(data_bitmap_block, &bitmap.to_block())
-                        .unwrap();
-                }
-            }
+            self.truncate_inode(&mut inode, 0);
 
-            //free the inode
             let inode_bitmap_block = self.superblock.inode_bitmap_block;
+
             let bitmap_data = self
                 .disk
                 .lock()
                 .unwrap()
                 .read_block(inode_bitmap_block)
                 .unwrap();
+
             let mut bitmap = Bitmap::from_block(bitmap_data);
+
             bitmap.free(inode_num);
+
             self.disk
                 .lock()
                 .unwrap()
                 .write_block(inode_bitmap_block, &bitmap.to_block())
                 .unwrap();
+
+            self.superblock.free_inodes += 1;
+
+            let sb_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&self.superblock as *const Superblock) as *const u8,
+                    std::mem::size_of::<Superblock>(),
+                )
+            };
+
+            let mut sb_block = [0u8; BLOCK_SIZE as usize];
+            sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
+
+            self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
         } else {
             //hard links still > 0, just write the update inode back
             inode_store.write_inode(inode_num, &inode);
@@ -841,7 +1034,7 @@ impl Filesystem for RustFS {
 
         //read that inode
         let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
-        let inode = inode_store.read_inode(inode_num);
+        let mut inode = inode_store.read_inode(inode_num);
 
         let entries = dir_store.list(inode_num);
         if entries.len() > 2 {
@@ -849,25 +1042,7 @@ impl Filesystem for RustFS {
             return;
         }
 
-        for i in 0..12 {
-            if inode.direct[i] != 0 {
-                let block_offset = inode.direct[i] - self.superblock.data_start_block;
-                let data_bitmap_block = self.superblock.data_bitmap_block;
-                let bitmap_data = self
-                    .disk
-                    .lock()
-                    .unwrap()
-                    .read_block(data_bitmap_block)
-                    .unwrap();
-                let mut bitmap = Bitmap::from_block(bitmap_data);
-                bitmap.free(block_offset);
-                self.disk
-                    .lock()
-                    .unwrap()
-                    .write_block(data_bitmap_block, &bitmap.to_block())
-                    .unwrap();
-            }
-        }
+        self.truncate_inode(&mut inode, 0);
 
         //free the directory's inode
         let inode_bitmap_block = self.superblock.inode_bitmap_block;
@@ -884,6 +1059,20 @@ impl Filesystem for RustFS {
             .unwrap()
             .write_block(inode_bitmap_block, &bitmap.to_block())
             .unwrap();
+
+        self.superblock.free_inodes += 1;
+
+        let sb_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&self.superblock as *const Superblock) as *const u8,
+                std::mem::size_of::<Superblock>(),
+            )
+        };
+
+        let mut sb_block = [0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
+
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
 
         //decrement parent's hard link
         let mut parent_inode = inode_store.read_inode(real_parent);
@@ -1161,32 +1350,10 @@ impl Filesystem for RustFS {
 
         if let Some(size) = _size {
             if size < inode.size {
-                let old_blocks_needed = ((inode.size + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize;
-                let new_blocks_needed = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize;
-
-                for block_idx in new_blocks_needed..old_blocks_needed {
-                    if block_idx < 12 && inode.direct[block_idx] != 0 {
-                        let block_offset =
-                            inode.direct[block_idx] - self.superblock.data_start_block;
-                        let data_bitmap_block = self.superblock.data_bitmap_block;
-                        let bitmap_data = self
-                            .disk
-                            .lock()
-                            .unwrap()
-                            .read_block(data_bitmap_block)
-                            .unwrap();
-                        let mut bitmap = Bitmap::from_block(bitmap_data);
-                        bitmap.free(block_offset);
-                        self.disk
-                            .lock()
-                            .unwrap()
-                            .write_block(data_bitmap_block, &bitmap.to_block())
-                            .unwrap();
-                        inode.direct[block_idx] = 0;
-                    }
-                }
+                self.truncate_inode(&mut inode, size);
+            } else {
+                inode.size = size;
             }
-            inode.size = size;
             changed = true;
         }
 

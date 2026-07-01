@@ -103,6 +103,7 @@ impl Journal {
                 .unwrap();
         }
 
+        self.disk.lock().unwrap().flush_all();
         self.commit_complete();
         print!("Journal recovery complete")
     }
