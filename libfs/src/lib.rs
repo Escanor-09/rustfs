@@ -1,4 +1,5 @@
 pub mod bitmap;
+pub mod cache_stats;
 pub mod dir;
 pub mod disk;
 pub mod inode;

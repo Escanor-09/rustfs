@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+use crate::cache_stats::CacheStats;
+
 const CACHE_CAPACITY: usize = 256;
 
 struct CacheEntry {
@@ -12,6 +14,8 @@ pub struct Disk {
     file: std::fs::File,
     cache: HashMap<u64, CacheEntry>,
     lru_order: VecDeque<u64>,
+    stats: CacheStats,
+    peak_occupancy: usize,
 }
 
 impl Disk {
@@ -27,6 +31,8 @@ impl Disk {
             file,
             cache: HashMap::new(),
             lru_order: VecDeque::new(),
+            stats: CacheStats::new(),
+            peak_occupancy: 0,
         })
     }
     //open an existing file
@@ -39,6 +45,8 @@ impl Disk {
             file: file1,
             cache: HashMap::new(),
             lru_order: VecDeque::new(),
+            stats: CacheStats::new(),
+            peak_occupancy: 0,
         })
     }
 
@@ -50,11 +58,13 @@ impl Disk {
     //read one block from disk
     pub fn read_block(&mut self, block_num: u64) -> io::Result<[u8; 4096]> {
         if let Some(entry) = self.cache.get(&block_num) {
+            self.stats.record_read_hit();
             let data = entry.data;
             self.touch_lru(block_num);
             return Ok(data);
         }
 
+        self.stats.record_read_miss();
         let offset = block_num * 4096;
         self.file.seek(SeekFrom::Start(offset))?;
         let mut buf = [0u8; 4096];
@@ -66,6 +76,12 @@ impl Disk {
 
     //write one block to disk
     pub fn write_block(&mut self, block_num: u64, data: &[u8; 4096]) -> io::Result<()> {
+        if self.cache.contains_key(&block_num) {
+            self.stats.record_write_hit();
+        } else {
+            self.stats.record_write_miss();
+        }
+
         self.insert_into_cache(block_num, *data, true);
         Ok(())
     }
@@ -81,10 +97,22 @@ impl Disk {
             self.cache.insert(block_num, CacheEntry { data, dirty });
         }
         self.touch_lru(block_num);
+
+        if self.cache.len() > self.peak_occupancy {
+            self.peak_occupancy = self.cache.len();
+        }
     }
 
     fn evict_one(&mut self) {
         if let Some(victim) = self.lru_order.pop_front() {
+            let is_dirty = self.cache.get(&victim).map_or(false, |e| e.dirty);
+
+            // println!("Evicting block {} (dirty: {})", victim, is_dirty);
+
+            self.stats.record_eviction();
+            if is_dirty {
+                self.stats.record_dirty_flush();
+            }
             self.flush_block(victim);
             self.cache.remove(&victim);
         }
@@ -111,7 +139,12 @@ impl Disk {
             .map(|(&b, _)| b)
             .collect();
         for block_num in dirty_blocks {
+            self.stats.record_dirty_flush();
             self.flush_block(block_num);
         }
+    }
+
+    pub fn print_cache_stats(&self) {
+        self.stats.print(CACHE_CAPACITY, self.peak_occupancy);
     }
 }

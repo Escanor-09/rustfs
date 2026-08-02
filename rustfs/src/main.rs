@@ -1307,6 +1307,7 @@ impl Filesystem for RustFS {
 
     fn destroy(&mut self) {
         self.disk.lock().unwrap().flush_all();
+        self.disk.lock().unwrap().print_cache_stats();
     }
 
     fn setattr(
