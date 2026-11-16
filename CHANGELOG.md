@@ -6,6 +6,88 @@ Every change to the code is recorded here. Each entry says what was wrong, why i
 
 ## Unreleased
 
+### Fixed: a full directory crashed the filesystem instead of returning ENOSPC
+
+**Date:** 2026-11-16
+**Files:** `libfs/src/dir.rs`, `rustfs/src/main.rs`, `libfs/examples/bench_dir_lookup.rs`
+
+#### The problem
+
+A directory's entries all live in one 4 KiB block (`inode.direct[0]`). Short names like `f1` … `f999` take 12 bytes each, so a block holds about **341 entries** (including `.` and `..`).
+
+When the block was nearly full, `prepare_add_entry` and `add_entry` shrank the last entry and wrote the new one after it **without checking that it fit**. Found by creating files in a loop in the root directory:
+
+```
+341 entries × 12 bytes = 4,092 bytes → 4 bytes left, new entry needs 12
+→ the name copy indexed block[4100..4104]
+→ panicked at libfs/src/dir.rs:351: "range start index 4100 out of range for slice of length 4096"
+```
+
+#### What happened as a result
+
+- The FUSE daemon crashed. The pending `create` failed with **Input/output error**.
+- The mount uses `MountOption::AutoUnmount`, so the mount disappeared and `ls` showed an empty `/tmp/mnt` (0 files). Your files weren't lost: fsck on the image afterwards was CONSISTENT, with `free_inodes 6058` (all 339 files present).
+- Any user could crash the filesystem by putting about 341 entries in one directory. `mkdir`, `symlink`, `link` and `rename` into a full directory crashed the same way. They also hit the `panic!("directory block full…")` at the end of the function.
+
+#### The fix
+
+**1. `libfs/src/dir.rs`: refuse instead of overflowing**
+
+- `prepare_add_entry` now returns `Option<(u64, [u8; 4096])>`. Before appending after the last entry, it checks `remaining < actual_size` and returns `None` without changing anything. The final `panic!` is now `None`.
+- `add_entry` was a line-for-line copy of `prepare_add_entry` plus a write. It now calls `prepare_add_entry` and writes the result, returning `Option<()>`, so the space check lives in one place.
+- New `has_space_for(dir, name) -> bool`: a dry run of `prepare_add_entry` that writes nothing.
+
+**2. `rustfs/src/main.rs`: return ENOSPC before changing anything**
+
+A new helper, `RustFS::dir_has_space`, wraps `has_space_for`. Most handlers allocate an inode or block, or bump a link count, *before* adding the directory entry, so a late failure would leave an orphan. They now check first:
+
+| Handler | Change |
+|---|---|
+| `create` | Matches on `prepare_add_entry`; `None` → `ENOSPC`. Already safe here, because nothing is written until the journal transaction that follows. |
+| `mkdir` | `dir_has_space` check at the top, before the inode or the data block is allocated |
+| `symlink` | Check at the top, before the inode is allocated |
+| `link` | Check at the top, before `hard_links += 1` |
+| `rename` | Check before the inode's ctime is written and before the old entry is removed |
+
+The later `add_entry` calls use `.expect(...)`, since space was already checked and the FUSE session handles one request at a time.
+
+**3. `libfs/examples/bench_dir_lookup.rs`:** updated for the new return type (`.expect`). The benchmark's largest count (300) fits in one block.
+
+#### Tests added (`libfs/src/dir.rs`)
+
+| Test | Checks |
+|---|---|
+| `full_directory_returns_none_instead_of_panicking` | Exactly 341 twelve-byte entries fit. The next add returns `None` from `has_space_for`, `prepare_add_entry` and `add_entry`, the block is byte-for-byte unchanged, and all 341 entries are still listed and found by `look_up`. |
+| `removed_slot_is_reused_when_full` | In a full directory, removing one entry frees its slot, a new name of the same size fits there, and the directory is full again afterwards. |
+
+#### Verification status
+
+**Verified on 2026-11-16** (Linux, cargo 1.96.0, debug build, fresh `mkfs` image):
+
+- `cargo test -p libfs`: **6 passed**, 0 failed. This includes `full_directory_returns_none_instead_of_panicking` and `removed_slot_is_reused_when_full`.
+- End to end, creating files in the root directory through the FUSE mount:
+
+```
+$ for i in $(seq 1 7000); do : > /tmp/mnt/f$i || { echo "stopped at $i"; break; }; done
+bash: /tmp/mnt/f340: No space left on device
+stopped at 340
+$ ls /tmp/mnt | wc -l
+339
+$ mkdir /tmp/mnt/x
+mkdir: cannot create directory '/tmp/mnt/x': No space left on device
+```
+
+  The daemon kept running with no panic. Before this fix, the same loop crashed the daemon at `f340` with `Input/output error`.
+- After unmounting, `fsck` reported `free_inodes 6058`, `free_blocks 25188`, **CONSISTENT**. The refused `mkdir` left no orphaned inode or block.
+
+#### Not addressed here
+
+- Directories are still limited to one block (about 341 short names, fewer with longer names). Growing a directory into `direct[1..]` would lift the limit.
+- `rename` checks for space even when renaming within the same directory, where removing the old name could free enough room. That case returns `ENOSPC` in a full directory.
+- Names over 255 bytes overflow the `name_len: u8` field. FUSE normally rejects these first, but the code doesn't check.
+
+---
+
 ### Changed: mkfs sizes the inode table from the disk size (was a fixed 2,048 inodes)
 
 **Date:** 2026-11-16
@@ -118,12 +200,11 @@ I checked this with a search: the only place the old values (`128`, `131`, `139`
 
 #### Verification status
 
-**Not yet compiled or run.** No Rust toolchain was available on the machine where this change was made. `u64::div_ceil` needs Rust 1.73 or later, which the README's requirement (1.75+) and the 2024 edition (1.85+) already cover. To verify on Linux or WSL:
+**Verified on 2026-11-16** (Linux, cargo 1.96.0, clean build):
 
-```bash
-cargo run --bin mkfs           # expect: "Layout: inode table 3-402 (6400 inodes), journal 403-410, data 411-25599 (25189 blocks)"
-cargo run --bin fsck -- myfs.img   # expect: free_inodes 6397, free_blocks 25188, "CONSISTENT"
-```
+- `cargo run --bin mkfs` printed `Layout: inode table 3-402 (6400 inodes), journal 403-410, data 411-25599 (25189 blocks)`.
+- `fsck` on the new image: `total_inodes 6400`, `free_inodes 6397`, `free_blocks 25188`, **CONSISTENT**.
+- Filling the filesystem through FUSE (40 subdirectories of 200 files each, so no single directory fills up) created **6,397** inodes before the first refusal. Before this change, the limit was 2,045. See the allocator entry below for the full run.
 
 #### Not addressed here
 
@@ -203,12 +284,24 @@ The `Bitmap` description in `README.md` was updated to match the new signature.
 
 #### Verification status
 
-**Not yet compiled or run.** No Rust toolchain was available on the machine where this change was made. To verify on Linux or WSL:
+**Verified on 2026-11-16** (Linux, cargo 1.96.0, clean build):
 
-```bash
-cargo build
-cargo test -p libfs
+- `cargo test -p libfs`: `alloc_stops_at_limit`, `alloc_limit_not_multiple_of_8` and `free_bit_is_reused` all pass.
+- End to end, exhausting every inode through the FUSE mount on a fresh image:
+
 ```
+$ for d in $(seq 1 40); do
+    mkdir /tmp/mnt/d$d || { echo "mkdir stopped at d$d"; break; }
+    for f in $(seq 1 200); do
+      : > /tmp/mnt/d$d/f$f || { echo "stopped at d$d/f$f"; break 2; }
+    done
+  done
+bash: /tmp/mnt/d32/f166: No space left on device
+stopped at d32/f166
+```
+
+  This is the expected stopping point: 6,397 free inodes = 31 × (1 dir + 200 files) + 1 dir + 165 files. The daemon did not panic and shut down cleanly on unmount.
+- `fsck` afterwards: `free_inodes 0`, `free_blocks 25156` (25,188 − 32 directory blocks), **CONSISTENT**. No inode was handed out past the end of the inode table.
 
 #### Known remaining issues (not fixed by this change)
 

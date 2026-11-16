@@ -44,6 +44,17 @@ impl RustFS {
         }
     }
 
+    //true if a new entry called `name` fits in directory `dir_ino`'s block.
+    //callers check this before allocating or writing anything, so a full
+    //directory returns ENOSPC without leaving orphaned inodes or blocks
+    fn dir_has_space(&self, dir_ino: u64, name: &str) -> bool {
+        let mut dir_store = DirStore::new(
+            self.disk.clone(),
+            InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
+        );
+        dir_store.has_space_for(dir_ino, name)
+    }
+
     //helper: convert Inode to FUSE FileAttr
     fn inode_to_attr(&self, ino: u64, inode: &Inode) -> FileAttr {
         let kind = if inode.mode & 0o170000 == 0o040000 {
@@ -656,7 +667,14 @@ impl Filesystem for RustFS {
         );
 
         let (dir_block_num, dir_block_data) =
-            dir_store.prepare_add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR);
+            match dir_store.prepare_add_entry(real_parent, name_str, inode_num as u32, FT_REGULAR) {
+                Some(entry) => entry,
+                None => {
+                    //directory block is full; nothing has been written yet
+                    reply.error(ENOSPC);
+                    return;
+                }
+            };
 
         let mut journal = Journal::new(self.disk.clone(), self.superblock.journal_start_block);
         journal.begin_transaction(&[
@@ -801,6 +819,12 @@ impl Filesystem for RustFS {
         _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
+        let parent_dir = if parent == 1 { 2 } else { parent };
+        if !self.dir_has_space(parent_dir, name.to_str().unwrap()) {
+            reply.error(ENOSPC);
+            return;
+        }
+
         let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
 
         let inode_bitmap_block = self.superblock.inode_bitmap_block;
@@ -919,7 +943,9 @@ impl Filesystem for RustFS {
             InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
         );
         let name_str = name.to_str().unwrap();
-        dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_DIRECTORY);
+        dir_store
+            .add_entry(real_parent, name_str, inode_num as u32, FT_DIRECTORY)
+            .expect("space was checked at the start of mkdir");
 
         //increment parent's hard links (new ".." points to it)
         let mut parent_inode = inode_store.read_inode(real_parent);
@@ -1127,13 +1153,20 @@ impl Filesystem for RustFS {
         let new_parent = if newparent == 1 { 2 } else { newparent };
         let new_name = newname.to_str().unwrap();
 
+        if !self.dir_has_space(new_parent, new_name) {
+            reply.error(ENOSPC);
+            return;
+        }
+
         inode.ctime = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         inode_store.write_inode(inode_num, &inode);
 
-        dir_store.add_entry(new_parent, new_name, inode_num as u32, file_type);
+        dir_store
+            .add_entry(new_parent, new_name, inode_num as u32, file_type)
+            .expect("space was checked earlier in rename");
         dir_store.remove_entry(old_parent, old_name).unwrap();
 
         if file_type == FT_DIRECTORY && old_parent != new_parent {
@@ -1182,6 +1215,11 @@ impl Filesystem for RustFS {
         let real_parent = if parent == 1 { 2 } else { parent };
         let name_str = link_name.to_str().unwrap();
         let target_path = target.to_str().unwrap();
+
+        if !self.dir_has_space(real_parent, name_str) {
+            reply.error(ENOSPC);
+            return;
+        }
 
         //allocate inode
         let inode_bitmap_block = self.superblock.inode_bitmap_block;
@@ -1253,7 +1291,9 @@ impl Filesystem for RustFS {
             self.disk.clone(),
             InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
         );
-        dir_store.add_entry(real_parent, name_str, inode_num as u32, FT_SYMLINK);
+        dir_store
+            .add_entry(real_parent, name_str, inode_num as u32, FT_SYMLINK)
+            .expect("space was checked at the start of symlink");
 
         let attr = self.inode_to_attr(inode_num, &new_inode);
         reply.entry(&TTL, &attr, 0);
@@ -1284,6 +1324,11 @@ impl Filesystem for RustFS {
         let real_newparent = if newparent == 1 { 2 } else { newparent };
         let new_name = newname.to_str().unwrap();
 
+        if !self.dir_has_space(real_newparent, new_name) {
+            reply.error(ENOSPC);
+            return;
+        }
+
         let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
         let mut inode = inode_store.read_inode(ino);
 
@@ -1300,7 +1345,9 @@ impl Filesystem for RustFS {
             InodeStore::new(self.disk.clone(), self.superblock.inode_table_block),
         );
 
-        dir_store.add_entry(real_newparent, new_name, ino as u32, FT_REGULAR);
+        dir_store
+            .add_entry(real_newparent, new_name, ino as u32, FT_REGULAR)
+            .expect("space was checked at the start of link");
 
         let attr = self.inode_to_attr(ino, &inode);
         reply.entry(&TTL, &attr, 0);

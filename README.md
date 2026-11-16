@@ -18,7 +18,7 @@ rustfs/
 │   └── lib.rs
 ├── mkfs/
 │   └── main.rs          # Formats a blank image with superblock, bitmaps, inode table, root dir
-├── fuse-daemon/
+├── rustfs/
 │   └── main.rs          # FUSE mount point (create, read, write, mkdir, unlink, rename, …)
 └── fsck/
     └── main.rs          # Filesystem consistency checker
@@ -176,7 +176,7 @@ cargo run --bin mkfs
 
 # mount (requires libfuse / fuse3 on your system)
 mkdir -p /tmp/mnt
-cargo run --bin fuse-daemon -- myfs.img /tmp/mnt
+cargo run --bin rustfs -- myfs.img /tmp/mnt
 
 # check consistency
 cargo run --bin fsck -- myfs.img

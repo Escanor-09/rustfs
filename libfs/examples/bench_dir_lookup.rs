@@ -90,7 +90,9 @@ fn main() {
         let (_disk, mut dir_store) = setup(&path);
 
         for i in 0..n {
-            dir_store.add_entry(DIR_INODE_NUM, &format!("f{i}"), 100 + i as u32, FT_REGULAR);
+            dir_store
+                .add_entry(DIR_INODE_NUM, &format!("f{i}"), 100 + i as u32, FT_REGULAR)
+                .expect("ENTRY_COUNTS must fit in one directory block");
         }
 
         let last_name = format!("f{}", n - 1);
