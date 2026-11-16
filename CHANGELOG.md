@@ -6,6 +6,184 @@ Every change to the code is recorded here. Each entry says what was wrong, why i
 
 ## Unreleased
 
+### Fixed: small bugs left after the rename fix (mkdir leak, wrong error on full disk, fsck blind spots, panics on bad arguments, rename edge cases)
+
+**Date:** 2026-11-16
+**Files:** `rustfs/src/main.rs`, `fsck/src/main.rs`, `scripts/e2e_test.sh`
+**Status:** Verified (end-to-end suite: new code 51/51, old code 31/51)
+
+Each fix is small and local. Design changes were deliberately left out (see "Not done" at the end).
+
+#### 1. `mkdir` leaked an inode when the disk was full
+
+**Found by:** filling the disk (`dd … bs=1M count=200`), then `mkdir newdir` → `ENOSPC` (correct), but fsck reported `ORPHANED INODE: 4 marked used in bitmap but not reachable from root`, and `free_inodes` was 6395 instead of 6396.
+
+**Why:** `mkdir` takes an inode from the bitmap (and writes the bitmap and superblock), and only **then** allocates the folder's data block. When the block allocation failed, it returned `ENOSPC` without giving the inode back.
+
+**Fix (2 lines in the failure branch):** free the inode with the existing `free_inode` helper before returning. The inode passed in is all zeros (size 0), so there are no data blocks to free; it only clears the bitmap bit and restores `free_inodes`.
+
+**Why not reorder (block first, then inode)?** That just moves the leak: the block would leak if the inode allocation failed. Undoing on failure is the smaller, safer change.
+
+#### 2. A full disk reported "File too large" instead of "No space left on device"
+
+**Found by:** the same `dd`: `dd: error writing '/tmp/mnt/fill': File too large` at 98 MiB, on a 100 MiB disk.
+
+**Why:** `write()` returned `EFBIG` whenever `get_or_alloc_block` returned `None`. That function returns `None` for two different reasons: the file would exceed the largest size the inode can address (12 + 512 + 512×512 blocks ≈ 1 GiB), **or** the disk has no free blocks.
+
+**Fix (2 lines):** if the block index is past the largest file size → `EFBIG`; otherwise → `ENOSPC`. The rest of `write()` is unchanged.
+
+**Why it matters:** programs handle these errors differently. `ENOSPC` means "free some space and retry"; `EFBIG` means "this file can't grow". Users were also told the wrong thing.
+
+#### 3. fsck missed two kinds of damage
+
+| New check | Where | What it catches | Before |
+|---|---|---|---|
+| `INVALID FILE TYPE` | `walk_directory`, for every reachable inode | `mode & 0o170000` is not a regular file, directory or symlink | The inode-size bug zeroed a directory's `mode`; fsck reported only misleading `LINK COUNT MISMATCH` errors |
+| `DUPLICATE NAME` | `walk_directory`, a set of names per folder | The same name appears twice in one folder | The rename bug's duplicate entries were reported as **CONSISTENT** |
+
+About 25 lines in total, using the folder walk that already exists.
+
+#### 4. `rustfs` panicked on a missing mount point or image
+
+**Found by:** a mistyped mount (`/tmp/mnt` didn't exist after a reboot): `panicked at rustfs/src/main.rs:507:54: called Result::unwrap() on an Err value … No such file or directory`.
+
+**Fix:** `main()` checks that the image file and the mount point exist, and prints a clear message with exit code 1. The `mount2(...).unwrap()` became an `if let Err(e)` with a message. Examples:
+```
+rustfs: mount point '/tmp/x' is not a directory (try: mkdir -p /tmp/x)
+rustfs: image 'foo.img' not found (create one with mkfs)
+```
+
+#### 5. Renaming to a new name in a full folder returned `ENOSPC`
+
+**Why:** `rename` checked for room for the new name **before** removing the old one. In a full folder, renaming within the same folder (`mv f1 g1`) was refused, even though removing `f1` frees the space `g1` needs.
+
+**Fix (same folder only, ~15 lines):** remove the old entry first, then check whether the new name fits. If it does, continue (and skip the later removal). If it doesn't (for example, a much longer name), **put the old entry back** and return `ENOSPC`. The put-back always fits because the old entry's own slot was just freed. For different folders, the behaviour is unchanged (the target folder must have room).
+
+**Note:** this is the one place where `rename` changes something before it's sure it will succeed. The change is undone on the failure path, and the e2e test checks that the old name survives a refused rename.
+
+#### 6. `renameat2` flags were ignored (backup check only)
+
+`rename` now returns `EINVAL` for `RENAME_EXCHANGE` (swapping isn't supported) and `EEXIST` for `RENAME_NOREPLACE` when the target exists.
+
+**Why:** after the rename fix, an unrecognised swap request would have been treated as "replace", which **deletes** the other file.
+
+**Honest note:** on this system these flags never reach the daemon. The kernel already refuses `NOREPLACE` when the target exists, and refuses `EXCHANGE` before calling FUSE, so the old code passes these tests too. The check only protects against a different kernel or FUSE library version.
+
+#### Verification: `scripts/e2e_test.sh` (6 new cases, 21 new checks)
+
+| Case | Old code (`ead0734`) | New code |
+|---|---|---|
+| Rename to a new, same-length name in a full folder | `ENOSPC` | ok |
+| Rename to a longer name in a full folder | refused, old name kept | refused, old name kept |
+| `renameat2` EXCHANGE / NOREPLACE | refused (by the kernel) | refused |
+| Disk full: write error | **"File too large"** | "No space left on device" |
+| Disk full: mkdir | refused, **fsck: ORPHANED INODE** | refused, fsck CONSISTENT |
+| Write integrity (300 KB random, cross-block `pwrite`, 50 unaligned appends) | ok | ok |
+| Missing mount point / image | **panic, exit 101** | message, exit 1 |
+| fsck on an image with a wiped `mode` | not reported as a type error | `INVALID FILE TYPE: inode 3` |
+| fsck on an image with a duplicate name | **CONSISTENT** | `DUPLICATE NAME: 'ab'` |
+| **Whole suite** | **31 passed, 20 failed** (includes the rename-fix cases) | **51 passed, 0 failed** |
+
+The fsck cases damage a test image on purpose with a few bytes of Python: zero an inode's `mode`, or rename an entry `ac` → `ab` in the folder block.
+
+`cargo test -p libfs`: 9 passed.
+
+#### Not done (design changes; left for a decision)
+
+- **`write()` handling a request that spans several blocks.** The code still assumes one request fits in one 4 KiB block. Tested: the kernel currently always splits writes at page boundaries, so this can't happen today. A loop over blocks was written and then **rolled back**: it restructures the main write path for a case that isn't reachable, so it's a design decision, not a bug fix.
+- **Journaling the remaining operations** (only `create` is journaled).
+- **Multi-block directories and bitmaps.**
+
+---
+
+### Fixed: `rename` lost data (moved folders looked empty; renaming onto an existing name left duplicates)
+
+**Date:** 2026-11-16
+**Files:** `rustfs/src/main.rs` (only `rename` and a new helper `free_inode`), `scripts/e2e_test.sh` (new)
+**Status:** Verified (end-to-end script: 30/30 on the new code, 12 failures on the old code)
+
+Kept deliberately small: `unlink` and `rmdir` are untouched, and `renameat2` flags are still ignored.
+
+#### Background: how a directory block is read
+
+Entries are read in a chain. Each entry header has `rec_len`, the distance to the next entry, and the last entry's `rec_len` reaches the end of the block. `.` is always at byte 0 (12 bytes) and `..` always at byte 12. In a brand-new directory, `..` is the last entry, so its `rec_len` is `4096 - 12`. Adding an entry shrinks `..` to 12 and appends after it.
+
+#### Bug A: moving a directory to a new parent hid everything inside it
+
+**Found by:** `mkdir d1 d2; touch d1/f; mv d1 d2/` → `ls d2/d1` was empty, and fsck reported `ORPHANED INODE: 5`.
+
+**Why:** to point the moved directory's `..` at its new parent, `rename` wrote a **whole new header** at byte 12, copied from `mkdir`:
+```rust
+DirEntryHeader { inode: new_parent, rec_len: BLOCK_SIZE - 12, name_len: 2, file_type: FT_DIRECTORY }
+```
+`rec_len = 4096 - 12` is only correct for an empty directory. For one with contents, it made `..` jump to the end of the block, so every entry after it was skipped. The entries were still on disk but unreachable: the files, their inodes and blocks were orphaned and leaked.
+
+**Fix:** read the existing `..` header, change **only** its `inode` field, and write it back (`read_unaligned`/`write_unaligned`, because the block is a byte array). A `debug_assert` checks that the entry at byte 12 really is `..`.
+
+#### Bug B: renaming onto an existing name added a second entry with that name
+
+**Found by:** `echo AAA > a; echo BBB > b; mv a b` → `ls -i` showed `3 b` twice. `cat b` showed `AAA` (from the kernel's cache), but **after a remount it showed `BBB`**: the rename was undone. `rm b` left one `b` behind. fsck said CONSISTENT.
+
+**Why:** `rename` called `add_entry(new_parent, new_name, …)` without checking whether `new_name` already existed. POSIX `rename(2)` says an existing target is **replaced**. Because nothing removed the old entry:
+- the directory held two entries with the same name, and `look_up` returns the first one, which is the old one
+- the replaced file's link count was never decreased, so its inode and blocks were never freed
+
+**Impact:** editors and tools save by writing a temporary file and renaming it over the original (vim, gedit, git, `sed -i`). On rustfs those saves **reverted to the old content after a remount**. Renaming a folder over a **non-empty** folder was also accepted, and the target's contents were lost.
+
+**Fix:** before changing anything, `rename` looks up `new_name` in `new_parent`:
+
+| Case | Behaviour (matches Linux) |
+|---|---|
+| Target doesn't exist | As before; needs free space in the folder (`ENOSPC` if full) |
+| Target is the same inode (two hard links to one file) | Do nothing, succeed |
+| File onto a folder | `EISDIR` |
+| Folder onto a file | `ENOTDIR` |
+| Folder onto a non-empty folder | `ENOTEMPTY` |
+| Otherwise | Remove the target's entry, then add the new one |
+
+When removing the target:
+- **File:** `hard_links -= 1`; if it reaches 0, free its blocks and inode (same steps as `unlink`). Other hard links keep the file alive.
+- **Empty folder:** free its block and inode (same steps as `rmdir`), and decrease the parent's link count (the removed folder's `..` no longer points at it).
+
+The space check is skipped when a target exists. Removing the entry frees exactly the space the same name needs, so replacing a name now works in a full folder (before, it returned `ENOSPC`).
+
+All checks happen **before** the first write, so a refused rename changes nothing (same rule as the full-directory fix).
+
+**New helper `free_inode`:** truncate to 0, clear the inode bitmap bit, `free_inodes += 1`, write the superblock. These are the same steps `unlink`/`rmdir` do inline; they were left untouched to keep this change small.
+
+**Also fixed (one line):** a renamed symlink's directory entry was recorded as `FT_REGULAR`; it now keeps `FT_SYMLINK`.
+
+#### Verification: `scripts/e2e_test.sh` (new)
+
+Each case mounts a fresh image (on ext4), runs real commands, **remounts** to defeat the kernel's caches, checks the result, and runs fsck. Run against both builds; the old build is `HEAD` (`ead0734`) built in a separate `git worktree`:
+
+| Case | Old code | New code |
+|---|---|---|
+| Move a folder with contents into another folder | contents missing; fsck: 2 orphaned inodes + link mismatch | ok, fsck CONSISTENT |
+| `mv a b` onto existing `b` | old content after remount; two `b` entries | ok |
+| Editor-style save (temp file + rename) | **reverted to v1 after remount** | ok |
+| Rename onto a hard-linked file | other link's count not decreased | ok |
+| Folder onto non-empty folder | **accepted; target's contents lost** | refused (`ENOTEMPTY`) |
+| File onto folder / folder onto file | refused | refused |
+| Renamed symlink | works | works |
+| Rename onto an existing name in a full folder | `ENOSPC` | ok |
+| **Total** | **18 passed, 12 failed** | **30 passed, 0 failed** |
+
+Two cases passed on the old code as well:
+- **Type mismatches:** the kernel's VFS refuses those itself before calling the daemon, so the new `EISDIR`/`ENOTDIR` checks are a backup safety check.
+- **Symlink:** reading a symlink uses the inode's `mode`, not the entry's type byte. The wrong type byte only affected `readdir`'s `d_type`.
+
+`cargo test -p libfs`: 9 passed.
+
+#### Not fixed (noted)
+
+- fsck reported CONSISTENT on directories with duplicate names. *(Fixed in the next entry.)*
+- `renameat2` flags were still ignored. *(Fixed in the next entry.)*
+- Renaming to a **new** name in a full folder still returned `ENOSPC`. *(Fixed in the next entry for the same folder.)*
+- Like most handlers except `create`, `rename` is not journaled; a crash in the middle can leave it half done.
+
+---
+
 ### Fixed: every inode write overwrote the next inode's `mode` and `uid`
 
 **Date:** 2026-11-16

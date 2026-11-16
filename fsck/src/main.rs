@@ -133,9 +133,21 @@ fn walk_directory(
     }
 
     let entries = dir_store.list(dir_inode_num);
+    let mut seen_names = HashSet::new();
 
     for (inode_num, name) in entries {
         let inode_num = inode_num as u64;
+
+        //a name may appear only once per directory. A duplicate makes the
+        //result of a lookup depend on entry order (an old rename bug left
+        //two entries with the same name; after a remount the stale one won)
+        if !seen_names.insert(name.clone()) {
+            println!(
+                "DUPLICATE NAME: '{}' appears more than once in directory inode {}",
+                name, dir_inode_num
+            );
+            *errors += 1;
+        }
 
         if name == "." {
             if inode_num != dir_inode_num {
@@ -162,6 +174,19 @@ fn walk_directory(
         *link_counts.entry(inode_num).or_insert(0) += 1;
 
         let inode = inode_store.read_inode(inode_num);
+
+        //every reachable inode must be a regular file, directory or symlink.
+        //Anything else means its mode was damaged (an old inode-size bug
+        //zeroed a neighbour's mode, which turned a directory into a
+        //"file"; without this check fsck only saw wrong link counts)
+        let file_type = inode.mode & 0o170000;
+        if file_type != 0o100000 && file_type != 0o040000 && file_type != 0o120000 {
+            println!(
+                "INVALID FILE TYPE: inode {} ('{}') has mode {:o}",
+                inode_num, name, inode.mode
+            );
+            *errors += 1;
+        }
 
         if collected_inodes.insert(inode_num) {
             collect_blocks(

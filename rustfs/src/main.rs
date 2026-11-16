@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{FileAttr, MountOption, ReplyAttr, Request};
 use fuser::{FileType, Filesystem};
-use libc::{EFBIG, ENOENT, ENOSPC};
+use libc::{EEXIST, EFBIG, EINVAL, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY};
 use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
 use libfs::journal::Journal;
@@ -486,6 +486,41 @@ impl RustFS {
         //If needed free double indirect
         //Update inode.size
     }
+
+    //Release an inode that no directory entry points to any more:
+    //free its data blocks, clear its bit in the inode bitmap and bump
+    //superblock.free_inodes. Used by rename when it replaces an existing target;
+    //same steps as the freeing code in unlink and rmdir.
+    fn free_inode(&mut self, inode_num: u64, inode: &mut Inode) {
+        self.truncate_inode(inode, 0);
+
+        let inode_bitmap_block = self.superblock.inode_bitmap_block;
+        let bitmap_data = self
+            .disk
+            .lock()
+            .unwrap()
+            .read_block(inode_bitmap_block)
+            .unwrap();
+        let mut bitmap = Bitmap::from_block(bitmap_data);
+        bitmap.free(inode_num);
+        self.disk
+            .lock()
+            .unwrap()
+            .write_block(inode_bitmap_block, &bitmap.to_block())
+            .unwrap();
+
+        self.superblock.free_inodes += 1;
+
+        let sb_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&self.superblock as *const Superblock) as *const u8,
+                std::mem::size_of::<Superblock>(),
+            )
+        };
+        let mut sb_block = [0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
+        self.disk.lock().unwrap().write_block(0, &sb_block).unwrap();
+    }
 }
 
 fn main() {
@@ -496,6 +531,16 @@ fn main() {
         .nth(2)
         .expect("Usage: rustfs <image> <mountpoint>");
 
+    //fail with a clear message instead of an unwrap() panic
+    if !std::path::Path::new(&image_path).is_file() {
+        eprintln!("rustfs: image '{}' not found (create one with mkfs)", image_path);
+        std::process::exit(1);
+    }
+    if !std::path::Path::new(&mountpoint).is_dir() {
+        eprintln!("rustfs: mount point '{}' is not a directory (try: mkdir -p {})", mountpoint, mountpoint);
+        std::process::exit(1);
+    }
+
     let filesystem = RustFS::new(&image_path);
 
     let options = vec![
@@ -504,7 +549,10 @@ fn main() {
         MountOption::AutoUnmount,
     ];
 
-    fuser::mount2(filesystem, &mountpoint, &options).unwrap();
+    if let Err(e) = fuser::mount2(filesystem, &mountpoint, &options) {
+        eprintln!("rustfs: failed to mount {} on {}: {}", image_path, mountpoint, e);
+        std::process::exit(1);
+    }
 }
 
 impl Filesystem for RustFS {
@@ -740,7 +788,10 @@ impl Filesystem for RustFS {
         let block_num = match self.get_or_alloc_block(&mut inode, block_index) {
             Some(n) => n,
             None => {
-                reply.error(EFBIG);
+                //past the largest file size -> EFBIG; otherwise the disk is
+                //full -> ENOSPC (was always EFBIG: "File too large" on a full disk)
+                const MAX_FILE_BLOCKS: usize = 12 + 512 + 512 * 512;
+                reply.error(if block_index >= MAX_FILE_BLOCKS { EFBIG } else { ENOSPC });
                 return;
             }
         };
@@ -865,6 +916,11 @@ impl Filesystem for RustFS {
         let actual_block = match self.alloc_data_block() {
             Some(block) => block,
             None => {
+                //the inode was already taken from the bitmap above; give it
+                //back or it leaks (marked used, never reachable). A blank
+                //inode has size 0, so free_inode has no blocks to free.
+                let mut blank: Inode = unsafe { std::mem::zeroed() };
+                self.free_inode(inode_num, &mut blank);
                 reply.error(ENOSPC);
                 return;
             }
@@ -1120,12 +1176,23 @@ impl Filesystem for RustFS {
         name: &std::ffi::OsStr,
         newparent: u64,
         newname: &std::ffi::OsStr,
-        _flags: u32,
+        flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        //same directory
+        //renameat2() flags. EXCHANGE (atomically swap two names) is not
+        //supported: without this check it was treated as a plain rename,
+        //which now REPLACES (deletes) the other file instead of swapping.
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        if flags & RENAME_EXCHANGE != 0 {
+            reply.error(EINVAL);
+            return;
+        }
+
         let old_parent = if parent == 1 { 2 } else { parent };
         let old_name = name.to_str().unwrap();
+        let new_parent = if newparent == 1 { 2 } else { newparent };
+        let new_name = newname.to_str().unwrap();
 
         let mut dir_store = DirStore::new(
             self.disk.clone(),
@@ -1144,20 +1211,98 @@ impl Filesystem for RustFS {
         let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
         let mut inode = inode_store.read_inode(inode_num);
 
-        let file_type = if inode.mode & 0o170000 == 0o040000 {
-            FT_DIRECTORY
-        } else {
-            FT_REGULAR
+        //the directory entry's type must match the inode (symlinks were
+        //previously recorded as FT_REGULAR after a rename)
+        let file_type = match inode.mode & 0o170000 {
+            0o040000 => FT_DIRECTORY,
+            0o120000 => FT_SYMLINK,
+            _ => FT_REGULAR,
         };
+        let src_is_dir = file_type == FT_DIRECTORY;
 
-        let new_parent = if newparent == 1 { 2 } else { newparent };
-        let new_name = newname.to_str().unwrap();
-
-        if !self.dir_has_space(new_parent, new_name) {
-            reply.error(ENOSPC);
-            return;
+        //---- 1. validate everything before changing anything ----
+        //
+        //If new_name already exists, rename must REPLACE it (POSIX rename(2)).
+        //Previously the new entry was added next to the old one, leaving two
+        //entries with the same name; after a remount look_up found the old
+        //one first, so the rename appeared undone.
+        let target = dir_store.look_up(new_parent, new_name.to_string()).map(|n| n as u64);
+        let mut target_inode = None;
+        let mut old_removed = false; //set when the old entry was removed early (full folder)
+        if let Some(t) = target {
+            if flags & RENAME_NOREPLACE != 0 {
+                reply.error(EEXIST);
+                return;
+            }
+            //old and new name are the same file (e.g. two hard links):
+            //POSIX says do nothing and succeed
+            if t == inode_num {
+                reply.ok();
+                return;
+            }
+            let t_inode = inode_store.read_inode(t);
+            let target_is_dir = t_inode.mode & 0o170000 == 0o040000;
+            match (src_is_dir, target_is_dir) {
+                (false, true) => {
+                    reply.error(EISDIR);
+                    return;
+                }
+                (true, false) => {
+                    reply.error(ENOTDIR);
+                    return;
+                }
+                (true, true) if dir_store.list(t).len() > 2 => {
+                    reply.error(ENOTEMPTY);
+                    return;
+                }
+                _ => {}
+            }
+            target_inode = Some((t, t_inode, target_is_dir));
+        } else if !self.dir_has_space(new_parent, new_name) {
+            //Same folder: removing the old name frees space, so try that
+            //first. If the new name still doesn't fit, put the old one back
+            //(it fits: its own slot was just freed) and refuse.
+            if old_parent == new_parent {
+                dir_store.remove_entry(old_parent, old_name).unwrap();
+                if dir_store.has_space_for(new_parent, new_name) {
+                    old_removed = true;
+                } else {
+                    dir_store
+                        .add_entry(old_parent, old_name, inode_num as u32, file_type)
+                        .expect("old entry's own slot was just freed");
+                    reply.error(ENOSPC);
+                    return;
+                }
+            } else {
+                //no existing entry to replace, so the new name needs free space.
+                //(when replacing, removing the old entry frees exactly the space
+                //the same name needs, so no check is required)
+                reply.error(ENOSPC);
+                return;
+            }
         }
 
+        //---- 2. remove the entry being replaced ----
+        if let Some((t, mut t_inode, target_is_dir)) = target_inode {
+            dir_store.remove_entry(new_parent, new_name).unwrap();
+            if target_is_dir {
+                //an empty directory: its only links were its name and its
+                //own "."; the parent loses the link from the target's ".."
+                self.free_inode(t, &mut t_inode);
+                let mut np = inode_store.read_inode(new_parent);
+                np.hard_links -= 1;
+                inode_store.write_inode(new_parent, &np);
+            } else {
+                t_inode.hard_links -= 1;
+                if t_inode.hard_links == 0 {
+                    self.free_inode(t, &mut t_inode);
+                } else {
+                    inode_store.write_inode(t, &t_inode);
+                }
+            }
+        }
+
+        //---- 3. move the entry ----
         inode.ctime = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1167,24 +1312,27 @@ impl Filesystem for RustFS {
         dir_store
             .add_entry(new_parent, new_name, inode_num as u32, file_type)
             .expect("space was checked earlier in rename");
-        dir_store.remove_entry(old_parent, old_name).unwrap();
+        if !old_removed {
+            dir_store.remove_entry(old_parent, old_name).unwrap();
+        }
 
-        if file_type == FT_DIRECTORY && old_parent != new_parent {
+        //---- 4. a directory that changed parent: repoint its ".." ----
+        if src_is_dir && old_parent != new_parent {
             let block_num = inode.direct[0];
             let mut block = self.disk.lock().unwrap().read_block(block_num).unwrap();
 
-            let dotdot_header = DirEntryHeader {
-                inode: new_parent as u32,
-                rec_len: (BLOCK_SIZE - 12) as u16,
-                name_len: 2,
-                file_type: FT_DIRECTORY,
-            };
-
+            //".." is always the second entry, at byte 12 (after the 12-byte
+            //"."). Change ONLY its inode number. The old code wrote a whole
+            //new header with rec_len = BLOCK_SIZE - 12 (copied from mkdir,
+            //where ".." is the last entry), which made ".." swallow every
+            //entry after it: the moved directory looked empty and its
+            //contents became unreachable orphans.
+            debug_assert_eq!(&block[20..22], b"..");
+            let mut dotdot: DirEntryHeader =
+                unsafe { std::ptr::read_unaligned(block[12..].as_ptr() as *const DirEntryHeader) };
+            dotdot.inode = new_parent as u32;
             unsafe {
-                std::ptr::write(
-                    block[12..].as_mut_ptr() as *mut DirEntryHeader,
-                    dotdot_header,
-                );
+                std::ptr::write_unaligned(block[12..].as_mut_ptr() as *mut DirEntryHeader, dotdot);
             }
             self.disk
                 .lock()
@@ -1192,7 +1340,8 @@ impl Filesystem for RustFS {
                 .write_block(block_num, &block)
                 .unwrap();
 
-            //adjust hard links
+            //adjust hard links: the moved directory's ".." now counts
+            //toward the new parent instead of the old one
             let mut old_parent_inode = inode_store.read_inode(old_parent);
             old_parent_inode.hard_links -= 1;
             inode_store.write_inode(old_parent, &old_parent_inode);
