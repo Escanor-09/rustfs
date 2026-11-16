@@ -69,6 +69,24 @@ rustfs: image 'foo.img' not found (create one with mkfs)
 
 **Honest note:** on this system these flags never reach the daemon. The kernel already refuses `NOREPLACE` when the target exists, and refuses `EXCHANGE` before calling FUSE, so the old code passes these tests too. The check only protects against a different kernel or FUSE library version.
 
+#### 7. `write()`: a tripwire instead of a hidden assumption
+
+**The assumption:** `write()` copies the whole request into **one** 4 KiB block (`block[off..off + len]`). If a request ever crossed a block boundary, that slice would panic and take the daemon down.
+
+**Why it can't happen now:** this daemon doesn't enable any optional FUSE write features, so the kernel sends at most one page (4 KiB), aligned to page boundaries, per request. Each page lines up with exactly one block. Verified with large, unaligned, cross-block and appending writes (all byte-for-byte correct).
+
+**What would make it happen:** only a change to this project. For example, enabling larger writes (`max_write` / big writes, the obvious next step for write speed), writeback caching, direct I/O, or a `fuser` upgrade that changes defaults. Whoever made that change would get a crash with nothing pointing back here.
+
+**Fix (decided with the user: option 2 of 3):** before allocating anything, check `bytes_offset_in_block + data.len() > BLOCK_SIZE`. If true, log `rustfs: write of N bytes at offset X crosses a block boundary; not supported` and return `EIO` instead of panicking. A comment above the check states the assumption and says the function must become a loop over blocks if those settings change.
+
+- *Option 1 (leave it)* was rejected: a future change would cause a silent crash.
+- *Option 3 (loop over blocks, ~20 lines)* is postponed: it's a design change, worth doing only together with enabling larger writes.
+
+**Verification:**
+- e2e suite still 51/51, and the tripwire never fired, confirming the assumption holds.
+- Write speed (20 MiB `dd`, release, ext4, 5 runs): 76.1, 80.8, 88.3, 96.5, 92.1 MiB/s, mean ≈ 87, within the earlier 90.7 ± 11.0. One comparison per request costs nothing measurable.
+- The tripwire **path itself can't be triggered** through the kernel with the current settings, so it's covered by review, not by a test.
+
 #### Verification: `scripts/e2e_test.sh` (6 new cases, 21 new checks)
 
 | Case | Old code (`ead0734`) | New code |
@@ -90,7 +108,7 @@ The fsck cases damage a test image on purpose with a few bytes of Python: zero a
 
 #### Not done (design changes; left for a decision)
 
-- **`write()` handling a request that spans several blocks.** The code still assumes one request fits in one 4 KiB block. Tested: the kernel currently always splits writes at page boundaries, so this can't happen today. A loop over blocks was written and then **rolled back**: it restructures the main write path for a case that isn't reachable, so it's a design decision, not a bug fix.
+- **`write()` handling a request that spans several blocks** (a loop over blocks). It was written and then **rolled back** as a design change. The tripwire (item 7) covers it until larger writes are enabled; do it at the same time as that change.
 - **Journaling the remaining operations** (only `create` is journaled).
 - **Multi-block directories and bitmaps.**
 

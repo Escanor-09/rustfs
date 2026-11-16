@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{FileAttr, MountOption, ReplyAttr, Request};
 use fuser::{FileType, Filesystem};
-use libc::{EEXIST, EFBIG, EINVAL, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY};
+use libc::{EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY};
 use libfs::bitmap::Bitmap;
 use libfs::inode::InodeStore;
 use libfs::journal::Journal;
@@ -784,6 +784,22 @@ impl Filesystem for RustFS {
         //figure out which block the data goes
         let block_index = offset as usize / BLOCK_SIZE as usize;
         let bytes_offset_in_block = offset as usize % BLOCK_SIZE as usize;
+
+        //ASSUMPTION: one request never crosses a 4 KiB block boundary. True
+        //with the current FUSE settings (the kernel sends at most one page,
+        //page-aligned). Enabling larger writes (max_write / big writes),
+        //writeback caching or direct I/O breaks it, and this function must
+        //then loop over blocks. Until then, refuse instead of panicking on
+        //the slice below. Checked before allocating, so nothing changes.
+        if bytes_offset_in_block + data.len() > BLOCK_SIZE as usize {
+            eprintln!(
+                "rustfs: write of {} bytes at offset {} crosses a block boundary; not supported",
+                data.len(),
+                offset
+            );
+            reply.error(EIO);
+            return;
+        }
 
         let block_num = match self.get_or_alloc_block(&mut inode, block_index) {
             Some(n) => n,
