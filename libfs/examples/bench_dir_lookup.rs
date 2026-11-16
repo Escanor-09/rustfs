@@ -38,7 +38,7 @@ fn setup(path: &str) -> (Arc<Mutex<Disk>>, DirStore) {
         direct: [DIR_DATA_BLOCK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         indirect: 0,
         double_indirect: 0,
-        _padding: [0u8; 96],
+        _padding: [0u8; 88],
     };
     setup_inode_store.write_inode(DIR_INODE_NUM, &dir_inode);
 

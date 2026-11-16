@@ -47,8 +47,17 @@ pub struct Inode {
     pub direct: [u64; 12],    //direct block pointers
     pub indirect: u64,        //single indirect block pointer
     pub double_indirect: u64, //double indirect pointer
-    pub _padding: [u8; 96],
+    //#[repr(C)] inserts 8 hidden bytes: 4 after `gid` (so `size` starts on an
+    //8-byte boundary) and 4 after `hard_links` (so `direct` does too).
+    //Fields + hidden padding = 168 bytes, so 88 more makes exactly 256.
+    //With 96 the struct was 264 bytes and every write spilled 8 bytes into
+    //the next inode's `mode` and `uid` (and past the block for slot 15).
+    pub _padding: [u8; 88],
 }
+
+//Every inode slot on disk is INODE_SIZE bytes. If a field is added or
+//reordered and the struct size drifts, refuse to compile.
+const _: () = assert!(std::mem::size_of::<Inode>() == INODE_SIZE as usize);
 
 //Directory Entry
 #[repr(C)]

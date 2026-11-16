@@ -6,6 +6,103 @@ Every change to the code is recorded here. Each entry says what was wrong, why i
 
 ## Unreleased
 
+### Fixed: every inode write overwrote the next inode's `mode` and `uid`
+
+**Date:** 2026-11-16
+**Files:** `libfs/src/layout.rs`, `libfs/src/inode.rs`, `libfs/src/dir.rs`, `mkfs/src/main.rs`, `rustfs/src/main.rs`, `libfs/examples/bench_dir_lookup.rs`
+**Status:** Verified (unit tests + end-to-end reproduction, before and after)
+
+#### The problem
+
+Inode slots on disk are `INODE_SIZE` = **256 bytes**, but `struct Inode` was **264 bytes**. `#[repr(C)]` puts every `u64` on an 8-byte boundary, so the compiler adds hidden padding the `_padding` field did not account for:
+
+```
+mode u32, uid u32, gid u32      0..12
+  [4 hidden bytes]             12..16   size (u64) must start at a multiple of 8
+size, ctime, atime, mtime      16..48
+hard_links u32                 48..52
+  [4 hidden bytes]             52..56   direct[] (u64) must start at a multiple of 8
+direct[12], indirect, d_ind    56..168
+_padding [u8; 96]             168..264  ← should have been 88
+```
+
+`write_inode` and the inode writes in `create`/`mkdir`/`symlink` copy the whole struct with `ptr::write`, so every write was 264 bytes into a 256-byte slot:
+
+- **Slots 0–14:** the last 8 bytes landed on the **first 8 bytes of the next inode**, which hold its `mode` (file type and permissions) and `uid`.
+- **Slot 15** (offset 3840): 3840 + 264 = 4104, so the write went **8 bytes past the 4 KiB block buffer**. `read_inode` read 8 bytes past it too. Both are undefined behaviour.
+
+#### Why it went unnoticed
+
+- **Read, modify, write updates restored the neighbour.** `read_inode` also reads 264 bytes, so the end of `_padding` holds the next inode's current `mode`/`uid`, and `write_inode` writes the same values back. The `dd` benchmark only does this kind of update, so it couldn't show the bug, and old and new code both had it.
+- **New inodes were always followed by free ones.** A newly built inode has zero padding, which wipes the next slot. On a fresh image inodes are handed out in order (3, 4, 5…), so the wiped slot was always unused.
+- It is a correctness bug, not a speed bug: 8 extra bytes per write cost nothing measurable.
+
+#### How it was reproduced (before the fix)
+
+Inode N is at byte `12288 + 256 × N` in the image (inode table starts at block 3), so inode 4 is at 13312.
+
+```bash
+touch /tmp/mnt/a; mkdir /tmp/mnt/d    # a = inode 3, d = inode 4
+# unmount → xxd -s 13312 -l 8 myfs.img →  fd41 0000 e803 0000   (dir 0o40775, uid 1000)
+rm /tmp/mnt/a; touch /tmp/mnt/c       # c reuses inode 3; its zero padding hits inode 4
+# unmount → xxd -s 13312 -l 8 myfs.img →  0000 0000 0000 0000   (mode and uid wiped)
+```
+
+After remounting:
+
+```
+---------- 2 root  hemal 4096 Nov 16 18:31 d      ← was drwxrwxr-x hemal
+bash: cd: /tmp/mnt/d: Not a directory
+```
+
+- `gid` (bytes 8–12) survived, which shows exactly 8 bytes were overwritten.
+- The directory's data block and entries were intact but could no longer be reached.
+- **fsck reported the wrong cause:** `root inode has hard_links = 3 but expected 2` and `inode 4 has hard_links = 2 but expected 1`. The stored link counts were correct. fsck no longer saw inode 4 as a directory, so it didn't count its `.` and `..`. A repair that "fixed" those counts would have made the damage worse.
+
+#### What could have happened
+
+Any user could trigger it with ordinary `rm` and create commands. Files and directories whose inode came right after a reused one lost their type and owner after a remount. A directory became an unreadable root-owned file and its contents were cut off. The 8-byte write past the buffer at slot 15 could, after a compiler or code change, overwrite a live stack variable and crash in an unrelated place.
+
+#### The fix
+
+1. **`libfs/src/layout.rs`:** `_padding: [u8; 96]` → `[u8; 88]`, with a comment explaining where the hidden 8 bytes come from.
+2. **Compile-time size check** below the struct:
+   ```rust
+   const _: () = assert!(std::mem::size_of::<Inode>() == INODE_SIZE as usize);
+   ```
+   If a field is ever added or reordered and the size drifts, the build fails instead of corrupting disks.
+3. **Every inode constructor** updated from `[0u8; 96]` to `[0u8; 88]`: `rustfs/src/main.rs` (3 places: create, mkdir, symlink), `mkfs/src/main.rs` (root inode), `libfs/src/dir.rs` (test), `libfs/examples/bench_dir_lookup.rs`.
+
+**On-disk compatibility:** every field keeps the same offset; only unused padding at the end of the struct got shorter. Existing images still open. **Images already damaged are not repaired**: an inode whose `mode` was wiped stays wiped.
+
+#### Tests added (`libfs/src/inode.rs`)
+
+| Test | Checks | Old code | New code |
+|---|---|---|---|
+| `inode_is_exactly_one_slot` | `size_of::<Inode>() == 256` | FAILED (264) | ok |
+| `new_inode_does_not_overwrite_next_inode` | Write a directory into inode 4, then a new file into inode 3; inode 4's `mode`/`uid` unchanged | FAILED (`mode` = 0) | ok |
+| `every_slot_in_a_block_round_trips` | Write all 16 slots of a block **in reverse order** (including slot 15) and read each back | FAILED | ok |
+
+The "old code" column was produced by running the new tests against `HEAD` in a separate `git worktree`. The slot test writes in reverse because in increasing order each write re-stamps the bytes the previous one spilled onto, which hides the bug.
+
+#### Verification (after the fix)
+
+- `cargo test -p libfs`: **9 passed, 0 failed**.
+- Same end-to-end sequence on a fresh image (release build, image on ext4):
+  ```
+  after mkdir d:          fd41 0000 e803 0000
+  after rm a + touch c:   fd41 0000 e803 0000     ← unchanged
+  drwxrwxr-x 2 hemal hemal 4096 … d
+  cd d: OK
+  fsck: FileSystem is CONSISTENT. No errors found.
+  ```
+
+#### Follow-up (not done)
+
+fsck should check that every inode marked in use has a valid file type (`mode & 0o170000` is a regular file, a directory or a symlink). Then this kind of damage is reported as what it is instead of as link-count mismatches.
+
+---
+
 ### Fixed: a full directory crashed the filesystem instead of returning ENOSPC
 
 **Date:** 2026-11-16

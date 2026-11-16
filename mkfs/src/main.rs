@@ -118,7 +118,7 @@ fn main() {
         direct: [data_start, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         indirect: 0,
         double_indirect: 0,
-        _padding: [0u8; 96],
+        _padding: [0u8; 88],
     };
 
     let mut inode_block = disk.read_block(inode_table_block).unwrap();

@@ -641,7 +641,7 @@ impl Filesystem for RustFS {
             direct: [0u64; 12],
             indirect: 0,
             double_indirect: 0,
-            _padding: [0u8; 96],
+            _padding: [0u8; 88],
         };
 
         let inodes_per_block = BLOCK_SIZE / INODE_SIZE;
@@ -932,7 +932,7 @@ impl Filesystem for RustFS {
             direct,
             indirect: 0,
             double_indirect: 0,
-            _padding: [0u8; 96],
+            _padding: [0u8; 88],
         };
 
         inode_store.write_inode(inode_num, &new_inode);
@@ -1281,7 +1281,7 @@ impl Filesystem for RustFS {
             direct,
             indirect: 0,
             double_indirect: 0,
-            _padding: [0u8; 96],
+            _padding: [0u8; 88],
         };
 
         let mut inode_store = InodeStore::new(self.disk.clone(), self.superblock.inode_table_block);
