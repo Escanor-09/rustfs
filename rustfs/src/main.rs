@@ -82,7 +82,8 @@ impl RustFS {
             .read_block(data_bitmap_block)
             .unwrap();
         let mut bitmap = Bitmap::from_block(bitmap_data);
-        let new_block_index = bitmap.alloc()?;
+        let total_data_blocks = self.superblock.total_blocks - self.superblock.data_start_block;
+        let new_block_index = bitmap.alloc(total_data_blocks)?;
 
         self.superblock.free_blocks -= 1;
 
@@ -594,7 +595,7 @@ impl Filesystem for RustFS {
 
         let mut bitmap = Bitmap::from_block(bitmap_data);
 
-        let inode_num = match bitmap.alloc() {
+        let inode_num = match bitmap.alloc(self.superblock.total_inodes) {
             Some(n) => n,
             None => {
                 reply.error(libc::ENOSPC);
@@ -812,7 +813,7 @@ impl Filesystem for RustFS {
 
         let mut bitmap = Bitmap::from_block(bitmap_data);
 
-        let inode_num = match bitmap.alloc() {
+        let inode_num = match bitmap.alloc(self.superblock.total_inodes) {
             Some(n) => n,
             None => {
                 reply.error(ENOSPC);
@@ -1191,7 +1192,7 @@ impl Filesystem for RustFS {
             .read_block(inode_bitmap_block)
             .unwrap();
         let mut bitmap = Bitmap::from_block(bimtap_data);
-        let inode_num = match bitmap.alloc() {
+        let inode_num = match bitmap.alloc(self.superblock.total_inodes) {
             Some(n) => n,
             None => {
                 reply.error(ENOSPC);

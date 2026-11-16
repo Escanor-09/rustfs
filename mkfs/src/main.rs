@@ -1,5 +1,8 @@
 use libfs::{disk::Disk, layout::*};
 
+//bytes of disk per inode when sizing the inode table (ext4's default is also 16 KiB)
+const BYTES_PER_INODE: u64 = 16 * 1024;
+
 fn main() {
     //parse: path and size
     let path = "myfs.img";
@@ -15,12 +18,45 @@ fn main() {
     let inode_bitmap_block: u64 = 1;
     let data_bitmap_block: u64 = 2;
     let inode_table_block: u64 = 3;
-    let inode_table_blocks: u64 = 128;
+
+    //size the inode table from the disk size: one inode per BYTES_PER_INODE bytes
+    //(16 KiB, the same default ratio as ext4's mkfs). A fixed count would run out of
+    //inodes on small-file workloads while most of the data region is still free.
+    let inodes_per_block: u64 = BLOCK_SIZE / INODE_SIZE;
+    let inode_table_blocks: u64 = (size_bytes / BYTES_PER_INODE).div_ceil(inodes_per_block);
+    let total_inodes: u64 = inode_table_blocks * inodes_per_block;
+
     let journal_start: u64 = inode_table_block + inode_table_blocks;
     let journal_blocks: u64 = 8;
     let data_start: u64 = journal_start + journal_blocks;
-    let total_inodes: u64 = inode_table_blocks * (BLOCK_SIZE / INODE_SIZE);
     let total_data_blocks: u64 = total_blocks - data_start;
+
+    //each bitmap is a single block, so it can track at most BLOCK_SIZE * 8 objects
+    let bitmap_capacity: u64 = BLOCK_SIZE * 8;
+    assert!(
+        total_inodes <= bitmap_capacity,
+        "{} inodes do not fit in a one-block inode bitmap (max {})",
+        total_inodes,
+        bitmap_capacity
+    );
+    assert!(
+        total_data_blocks <= bitmap_capacity,
+        "{} data blocks do not fit in a one-block data bitmap (max {})",
+        total_data_blocks,
+        bitmap_capacity
+    );
+
+    println!(
+        "Layout: inode table {}-{} ({} inodes), journal {}-{}, data {}-{} ({} blocks)",
+        inode_table_block,
+        journal_start - 1,
+        total_inodes,
+        journal_start,
+        data_start - 1,
+        data_start,
+        total_blocks - 1,
+        total_data_blocks
+    );
 
     //write super block
     let superblock = Superblock {
@@ -29,7 +65,7 @@ fn main() {
         total_blocks,
         total_inodes,
         free_blocks: total_data_blocks - 1, //-1 for root dir block
-        free_inodes: total_inodes - 3,      //-1 for root inode
+        free_inodes: total_inodes - 3,      //-3 for inodes 0, 1 (reserved) and 2 (root)
         inode_bitmap_block,
         data_bitmap_block,
         inode_table_block,
