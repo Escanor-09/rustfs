@@ -1,0 +1,397 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{array}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  backgroundcolor=\color{white},
+  commentstyle=\color{gray},
+  showstringspaces=false,
+  xleftmargin=2pt,
+  xrightmargin=2pt
+}
+
+\title{\textbf{RustFS: Project Report}\\
+\large A Journaled, Crash-Safe ext2-Style Filesystem in Rust,\\
+Verified via a Real FUSE Mount and Real \texttt{fsck} Runs}
+\author{Hemal Kisku}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{System Description}
+
+\subsection{What we implemented}
+
+We implemented a FUSE-based filesystem, \textbf{rustfs}, built from scratch in Rust and modeled
+after the classic ext2 on-disk layout. The system is not a toy simulation of a filesystem's data
+structures — it is a real block device image, mountable with the Linux kernel's FUSE interface,
+that a shell, \texttt{dd}, \texttt{ls}, or any other unmodified POSIX program can read from and
+write to.
+
+The project consists of four crates sharing one core library:
+\begin{itemize}
+    \item \textbf{libfs} — the on-disk layout (superblock, inode, directory entry, journal header
+    structs), a block-device abstraction with an LRU write-back cache, a bit-level allocator for
+    inodes and data blocks, an inode table reader/writer, a directory-entry store, and a
+    write-ahead journal.
+    \item \textbf{mkfs} — formats a blank image with a superblock, both bitmaps, a zeroed inode
+    table, and a root directory.
+    \item \textbf{rustfs} (the FUSE daemon) — mounts an image and implements 16 POSIX operations
+    (\texttt{lookup}, \texttt{getattr}, \texttt{setattr}, \texttt{readdir}, \texttt{create},
+    \texttt{read}, \texttt{write}, \texttt{mkdir}, \texttt{rmdir}, \texttt{unlink},
+    \texttt{rename}, \texttt{symlink}, \texttt{readlink}, \texttt{link}, \texttt{destroy}, plus
+    initialization) against that image.
+    \item \textbf{fsck} — an independent, from-scratch consistency checker that walks the same
+    on-disk image without going through the FUSE daemon at all, and reports (rather than silently
+    trusts) whether the metadata is internally consistent.
+\end{itemize}
+
+\subsection{Why it is useful}
+
+Implementing a filesystem's data structures is the easy 80\% — inode tables and bitmaps are
+straightforward once the layout is fixed. The parts that actually determine whether a filesystem
+is trustworthy are the parts that are hard to get right by inspection alone:
+
+\begin{itemize}
+    \item \textbf{Crash consistency.} A metadata update that touches several blocks (allocate an
+    inode, update a bitmap, link a directory entry) must appear atomic even if the process is
+    killed mid-update. This cannot be verified by reading the code — it has to be verified by
+    actually killing the process mid-update and checking what is left behind.
+    \item \textbf{Consistency, not just correctness of the happy path.} A filesystem can pass
+    every functional test and still leak an inode, double-allocate a block, or corrupt a bitmap
+    counter under conditions the happy-path tests never exercise. \texttt{fsck} exists precisely
+    to catch that class of bug independently of whatever the FUSE daemon believes about its own
+    state.
+    \item \textbf{Real measurement over assumed complexity.} A cost claim such as ``directory
+    lookup is $O(n)$'' or ``fsck scales with used inodes'' is an assumption until it is measured.
+    Every performance claim in this report is a number produced by actually running the code
+    against a real mounted filesystem, not an estimate of the data structure's asymptotic shape.
+\end{itemize}
+
+This project was built to internalize those three properties — journaled crash safety, an
+independent consistency checker, and measurement-verified performance claims — the same way a
+production filesystem is expected to justify them, at a scale small enough to implement, break,
+and fix by hand.
+
+\section{Analysis Used}
+
+\subsection{Dimensions of precision}
+
+Several places in the design deliberately trade generality for a bounded, predictable cost, mirroring
+the same kind of scope discipline production filesystems apply at much larger scale:
+
+\begin{itemize}
+    \item \textbf{Bounded block-pointer scheme.} Each inode has 12 direct pointers, one single-indirect
+    pointer, and one double-indirect pointer — no triple indirect. At a 4\,KiB block size this caps a
+    file at $12 + 512 + 512^2 \approx 262{,}656$ blocks ($\approx$1.03\,GiB), which is far larger than
+    anything the 100\,MiB seed image can hold. Triple indirect was deliberately not implemented: it would
+    add a third layer of pointer-chasing code for a ceiling the target image size can never reach.
+    \item \textbf{Fixed-size, bounded journal.} The journal supports at most \texttt{MAX\_JOURNAL\_BLOCKS = 4}
+    data blocks per transaction, written to a fixed 8-block on-disk region (one header block plus four data
+    blocks) rather than a general-purpose variable-length circular log. This is enough to atomically cover
+    every metadata operation the daemon performs (bitmap + superblock + inode-table + one directory block),
+    and a fixed region means recovery only ever has to check one header, not scan for log boundaries.
+    \item \textbf{Fixed-capacity LRU cache.} \texttt{Disk} caches exactly 256 blocks (1\,MiB) with
+    write-back semantics rather than a dynamically-sized cache. Eviction flushes dirty entries before
+    dropping them, so capacity is a memory/hit-rate tradeoff, never a correctness one.
+    \item \textbf{Linked-list directory format.} Directory entries are a singly-linked list of
+    variable-length records packed into one 4\,KiB block (\texttt{inode.direct[0]}, no external growth) — the
+    same layout ext2 itself uses before hashed directories. This is $O(n)$ per lookup by construction; Section
+    4.2 measures that cost directly rather than assuming it.
+    \item \textbf{\texttt{fsck} scans by capacity, not by usage.} The inode-bitmap check iterates
+    \texttt{0..total\_inodes} (a fixed 2048-slot range) regardless of how many inodes are actually allocated.
+    This was a deliberate simplicity choice — it avoids needing a second, separately-maintained count of live
+    inodes — at the cost of \texttt{fsck}'s runtime being bound by total filesystem capacity rather than by how
+    full the filesystem is. Section 4.2 measures this tradeoff explicitly.
+\end{itemize}
+
+\subsection{Assumptions}
+
+\begin{itemize}
+    \item \textbf{Single physical writer.} All disk access goes through one \texttt{Arc<Mutex<Disk>>}
+    shared by the FUSE daemon's callback handlers. This serializes every block read/write across
+    concurrent FUSE requests — correct and simple, at the cost of no parallel I/O within one mount.
+    \item \textbf{Fixed on-disk geometry.} The layout (2048 inodes across 128 inode-table blocks, one
+    global 8-block journal region, a 100\,MiB seed image) is chosen at \texttt{mkfs} time and is not
+    resizable afterward. There is no online or offline resize tool.
+    \item \textbf{At most one pending transaction.} Journal recovery assumes a single global journal
+    region can hold at most one committed-but-unapplied transaction at a time — correct because
+    \texttt{begin\_transaction} is only ever called from within one already-serialized FUSE handler, but
+    it would not extend to a design that pipelines multiple in-flight transactions.
+    \item \textbf{Flat, C-compatible on-disk structs.} Every on-disk structure (\texttt{Superblock},
+    \texttt{Inode}, \texttt{DirEntryHeader}, \texttt{JournalHeader}) is \texttt{\#[repr(C)]} and
+    (de)serialized with raw \texttt{std::ptr::read}/\texttt{std::ptr::write} rather than a serialization
+    crate — a zero-copy design that assumes the reader and writer always agree on the exact struct layout
+    (no versioning, no forward/backward compatibility).
+\end{itemize}
+
+\section{Implementation Details}
+
+\subsection{Write path: cache, journal, then FUSE}
+
+A metadata-mutating FUSE call (e.g. \texttt{create}) follows the same shape every time: compute the
+new in-memory state (allocated inode, updated bitmap, updated superblock counters, updated directory
+block), hand every touched block to \texttt{journal.begin\_transaction(\&[\ldots])} \emph{before} any
+of those blocks are written to their real locations, then apply the real writes, then call
+\texttt{journal.commit\_complete()} to clear the journal. On mount, \texttt{Journal::recover()} checks
+the journal header for a committed-but-not-yet-cleared transaction and replays it before the daemon
+serves its first request — so a crash between the journal write and the real writes is always
+recoverable, and a crash before the journal write simply never happened as far as the filesystem is
+concerned.
+
+\subsection{Before/After examples}
+
+\textbf{Snippet 1 --- Crash injected mid-transaction, recovered on remount.} A \texttt{CRASH\_TEST}
+environment variable was added at the exact point between the journal commit and the real writes, to
+make the crash window reproducible instead of relying on timing an external kill signal:
+
+\begin{lstlisting}
+journal.begin_transaction(&[
+    (inode_bitmap_block, new_inode_bitmap),
+    (0, sb_block),
+    (inode_block_idx, inode_table_block_data),
+    (dir_block_num, dir_block_data),
+]);
+
+if std::env::var("CRASH_TEST").is_ok() {
+    std::process::exit(1);   // simulate a crash after commit, before real writes
+}
+// ... real writes to bitmap / superblock / inode table / directory ...
+journal.commit_complete();
+\end{lstlisting}
+Running \texttt{CRASH\_TEST=1 cargo run --bin rustfs -- myfs.img /tmp/mnt} against a \texttt{create}
+kills the daemon after the journal is committed but before any real block is written. Remounting
+without \texttt{CRASH\_TEST} set triggers \texttt{Journal::recover()}, which replays all four blocks
+from the journal and leaves the image identical to a run that never crashed.
+
+\textbf{Snippet 2 --- Indirect addressing before and after the fix.} Before
+\texttt{d093a25}, writes only ever touched \texttt{inode.direct[0..12]} — files were silently capped
+at 48\,KiB with no error. \texttt{get\_or\_alloc\_block} now dispatches on the logical block index:
+\begin{lstlisting}
+fn get_or_alloc_block(&mut self, inode: &mut Inode, block_index: usize) -> Option<u64> {
+    if block_index < 12 {
+        // direct
+    } else if block_index < 12 + 512 {
+        // single indirect: allocate/zero the pointer block on first use, then index into it
+    } else if block_index < 12 + 512 + 512 * 512 {
+        // double indirect: allocate outer block, then inner block, then the data block
+    } else {
+        None
+    }
+}
+\end{lstlisting}
+A 20\,MiB \texttt{dd} write (Section 4.2, Benchmark 1) exercises the single-indirect path directly and
+would have failed outright under the pre-fix direct-only code.
+
+\textbf{Snippet 3 --- Duplicate-block detection, before and after.} \texttt{fsck} originally recorded
+referenced blocks in a \texttt{HashSet<u64>}:
+\begin{lstlisting}
+// before: two inodes pointing at the same block collapse into one set entry —
+// the second owner is invisible, so duplicate allocation can never be reported.
+if block != 0 { referenced_blocks.insert(block); }
+\end{lstlisting}
+\begin{lstlisting}
+// after: every owner is recorded, so a block with more than one owner is detectable,
+// and re-walking the same inode twice (e.g. via two directory paths) is guarded separately
+// so it isn't double-counted as its own "duplicate".
+block_owner.entry(block).or_default().push(inode_num);
+\end{lstlisting}
+This also folded in bounds checking (a block index outside \texttt{[data\_start\_block, total\_blocks)}
+is reported immediately instead of being followed into an out-of-range read), and a
+\texttt{collected\_inodes} guard so an inode reachable by more than one directory path is only
+scanned for its own block pointers once.
+
+\subsection{Key challenges}
+
+\begin{enumerate}
+    \item \textbf{Journal did not cover directory writes.} The journal originally wrapped the inode
+    bitmap, superblock, and inode-table writes for \texttt{create}, but the directory-entry write that
+    actually links the new inode into its parent directory happened afterward, unjournaled. A crash in
+    that window left a fully-allocated inode with no directory entry pointing at it — an orphaned inode,
+    invisible to \texttt{ls} but consuming an inode slot forever. Fixed in \texttt{e66f46d} by adding
+    \texttt{DirStore::prepare\_add\_entry}, which computes the modified directory block \emph{without}
+    writing it, so it can be folded into the same \texttt{begin\_transaction} call as the other three
+    blocks instead of being written separately afterward. This is also precisely the failure mode the
+    \texttt{fsck} orphaned-inode check (added next, in \texttt{ae5872f}) was built to detect.
+    \item \textbf{\texttt{fsck} traversed the same inode and the same block more than once.} Two related
+    bugs, fixed together in \texttt{a25af53}: (a) a directory reachable by more than one path (or visited
+    while walking both its own entries and a hard link) had its block pointers collected once per visit,
+    which double-counted legitimately-shared blocks as ``duplicates''; (b) the referenced-block set was a
+    plain \texttt{HashSet}, which cannot distinguish ``referenced once'' from ``referenced by two different
+    inodes'' — the actual definition of a duplicate-allocation bug. Fixed by tracking a
+    \texttt{HashMap<block, Vec<owning\_inode>>} instead of a set, and gating block collection per inode
+    behind a \texttt{collected\_inodes} guard (Snippet 3 above).
+    \item \textbf{Single- and double-indirect blocks were never wired into the write path.} Only direct
+    pointers were populated by \texttt{write()}/\texttt{read()}, silently truncating any file past
+    48\,KiB with no reported error — the worst kind of bug, since it fails quietly rather than loudly.
+    Fixed in \texttt{d093a25} by implementing \texttt{get\_or\_alloc\_block} and
+    \texttt{get\_block\_readonly} with the three-tier dispatch shown in Snippet 2.
+    \item \textbf{\texttt{fsck}'s diagnostic dump printed struct offsets instead of field values.}
+    \texttt{std::mem::offset\_of!(Superblock, field)} returns the field's \emph{byte offset within the
+    struct}, not its value. This was accidentally used in the startup diagnostic dump, so a real
+    2048-inode filesystem printed \texttt{total\_inodes 24} (an offset) instead of \texttt{2048} (the
+    actual count) — a purely cosmetic bug, since every actual consistency check downstream read the
+    correct field values via ordinary struct access; only the printed dump was wrong. Caught while
+    diagnosing the \texttt{fsck} scan-time benchmark (Section 4.2, Benchmark 4) and fixed by replacing
+    every \texttt{offset\_of!} call with the field itself.
+    \item \textbf{Benchmark methodology artifacts had to be ruled out before trusting a number,
+    for every one of the four benchmarks.} An early metadata-throughput pass showed delete running
+    17$\times$ slower than create (373 vs.\ 5{,}997 ops/s). The filesystem was not the cause: the delete
+    loop invoked \texttt{rm} once per file (forking a new process every iteration) while the create loop
+    used bash's \texttt{: >} builtin (no fork). Running the identical \texttt{rm} loop against the host's
+    own ext4 reproduced the same $\sim$0.4--0.8\,s overhead with no filesystem code involved at all,
+    confirming the gap was shell process-startup cost, not rustfs. Corrected by measuring deletes with
+    \texttt{find -delete} (a single process), which brought both numbers into the same range
+    ($\sim$5{,}800--6{,}000 ops/s). The sequential-I/O benchmark required a matching discipline: a fresh
+    image per run, remounted between write and read, specifically to drop both the in-process block
+    cache and the kernel page cache so a warm-cache read was never mistaken for real disk throughput.
+\end{enumerate}
+
+\section{Result Tables}
+
+\subsection{Functional correctness --- what \texttt{fsck} checks}
+
+\texttt{fsck} is a from-scratch, independent walk of the on-disk image (it does not go through the
+FUSE daemon or its cache), and reports every inconsistency it finds rather than stopping at the first
+one:
+
+\begin{center}
+\begin{tabular}{p{5.4cm}p{8.4cm}}
+\toprule
+\textbf{Check} & \textbf{What it catches} \\
+\midrule
+Magic number & Corrupt or wrong image \\
+Block pointer validity & Pointers outside the data region \\
+Duplicate block allocation & Two inodes sharing a data block \\
+\texttt{.} / \texttt{..} correctness & Directory self/parent links wrong \\
+Directory cycle detection & Infinite loops in the directory tree \\
+Inode bitmap consistency & Inodes referenced but marked free; orphaned inodes \\
+Data bitmap consistency & Leaked blocks; blocks referenced but marked free \\
+Hard link counts & \texttt{hard\_links} field doesn't match actual directory references \\
+Superblock counters & \texttt{free\_blocks} / \texttt{free\_inodes} out of sync with bitmaps \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Benchmarks}
+
+Four benchmarks, 5 runs each, against a 100\,MiB image on a local FUSE mount. Every number below
+required ruling out a measurement artifact first (Section 3.3, item 5); the methodology described
+there is what makes these numbers trustworthy rather than just fast-looking.
+
+\textbf{Benchmark 1 --- Sequential I/O throughput.} 20\,MiB file, \texttt{dd}, fresh image per run,
+remounted between write and read.
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & \textbf{Mean} & \textbf{Stddev} \\
+\midrule
+Write & 74.28 MiB/s & 5.33 \\
+Read  & 414.14 MiB/s & 100.5 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Benchmark 2 --- Metadata operation throughput.} 200 file creates/deletes per run through the
+FUSE mount, measured with the corrected (single-process) methodology from Section 3.3, item 5.
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+ & \textbf{Mean} \\
+\midrule
+Create & $\sim$5{,}997 ops/s \\
+Delete & $\sim$5{,}826 ops/s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Benchmark 3 --- Directory lookup latency vs.\ entry count.} In-process microbenchmark
+(\texttt{libfs/examples/bench\_dir\_lookup.rs}), bypassing FUSE entirely to isolate
+\texttt{DirStore::look\_up()} from kernel dispatch overhead. 100{,}000 iterations per data point, 5
+runs averaged, entry counts from 10 up to $\sim$300 (the block's practical capacity):
+\[
+\text{latency(ns)} \approx 207 + 20.7 \times \text{entry\_count} \qquad (R^2 > 0.999)
+\]
+This confirms the $O(n)$ cost predicted by the linked-list directory format (Section 2.1) directly,
+rather than assuming it from the data structure alone, and marks hashed or indexed directory entries
+as the natural next step if larger directories are ever needed.
+
+\textbf{Benchmark 4 --- \texttt{fsck} scan time vs.\ file count.} \texttt{fsck} timed against images
+pre-populated with 0, 50, 100, 150, and 200 files, 5 runs each.
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+\textbf{Files} & \textbf{Mean} \\
+\midrule
+0   & 3.4 ms \\
+50  & 3.0 ms \\
+100 & 2.4 ms \\
+150 & 2.4 ms \\
+200 & 2.8 ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+Flat, not linear — confirming the Section 2.1 prediction that \texttt{fsck}'s cost is bound by total
+filesystem capacity (a fixed 2048-inode scan range), not by how full the filesystem is.
+
+\subsection{Real bugs found and their measured/observed effect}
+
+\begin{center}
+\begin{tabular}{p{3.6cm}p{4.6cm}p{4.6cm}}
+\toprule
+\textbf{Bug} & \textbf{Symptom before fix} & \textbf{Result after fix} \\
+\midrule
+Journal excluded directory writes & Crash between inode alloc and dir-link produced an orphaned inode & Directory write folded into the same journaled transaction; recoverable across the crash window (Snippet 1) \\
+\texttt{fsck} duplicate-block tracking used a \texttt{HashSet} & Two inodes sharing a block, or one inode walked twice, were indistinguishable & \texttt{HashMap<block,\allowbreak Vec<owner>>} + per-inode collection guard; duplicates now attributable to actual owners \\
+Indirect/double-indirect never wired into writes & Files silently truncated at 48\,KiB with no error & Three-tier \texttt{get\_or\_alloc\_block} dispatch; 20\,MiB sequential write (Benchmark 1) exercises the fix directly \\
+\texttt{fsck} diagnostic dump used \texttt{offset\_of!} & Startup dump printed byte offsets (e.g.\ \texttt{total\_inodes 24}) instead of real values & Dump prints actual field values; consistency-check logic itself was never affected \\
+Delete-benchmark artifact & Delete measured 17$\times$ slower than create (373 vs.\ 5{,}997 ops/s) & Traced to per-file \texttt{rm} fork cost (reproduced on host ext4); \texttt{find -delete} brings both to $\sim$5{,}800--6{,}000 ops/s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Discussion of results}
+
+\begin{enumerate}
+    \item \textbf{Read throughput exceeds write by $>5\times$ mainly because of the write-back cache
+    and the 20\,MiB size relative to the 1\,MiB cache}: writes pay real disk I/O as dirty blocks are
+    evicted, while a chunk of the subsequent read is served from blocks already resident. This is
+    reported as-measured rather than attributed without evidence — a full page-cache-bypassing
+    re-run per read would be needed to separate ``fast because cached'' from ``fast because the read
+    path is simply cheaper,'' and is noted here as the natural follow-up rather than assumed.
+    \item \textbf{The $O(n)$ directory-lookup cost is a direct, measured consequence of the format
+    choice in Section 2.1}, not an incidental slowdown — the same linked-list layout that keeps
+    \texttt{add\_entry}/\texttt{remove\_entry} simple is what produces the linear slope. The
+    benchmark exists specifically to make that tradeoff visible instead of implicit.
+    \item \textbf{\texttt{fsck}'s flat scan time is the direct, measured consequence of the capacity-bound
+    design choice in Section 2.1}: iterating a fixed 2048-slot range costs the same whether 0 or 200
+    files are populated, which is expected given the code, but was verified rather than assumed.
+    \item \textbf{Every bug in Section 4.3 was found by cross-checking two independent views of the
+    same on-disk state} — the FUSE daemon's writes against \texttt{fsck}'s independent walk, or a
+    benchmark's number against a second, differently-instrumented measurement of the same operation —
+    rather than by code inspection alone. This is the same principle the crash-injection harness
+    (\texttt{CRASH\_TEST}, Snippet 1) applies to durability: don't trust that a recovery path works,
+    trigger the crash and check what's actually on disk afterward.
+\end{enumerate}
+
+\vspace{1em}
+\noindent\rule{\textwidth}{0.4pt}\\
+\footnotesize
+Stack: Rust, \texttt{fuser} (FUSE bindings), \texttt{libfuse3}/\texttt{macFUSE}. Verified against a
+real local FUSE mount on Linux; all benchmark and bug-reproduction numbers in this report were
+measured against real disk images, not simulated.
+
+\end{document}
