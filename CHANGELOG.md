@@ -6,6 +6,29 @@ Every change to the code is recorded here. Each entry says what was wrong, why i
 
 ## Unreleased
 
+### Docs: README brought in line with the current code
+
+**Date:** 2026-11-16
+**Files:** `README.md` (REPORT.tex / REPORT.pdf deliberately unchanged: they describe the submitted version)
+
+Corrected statements that were wrong or out of date:
+
+| Was | Now |
+|---|---|
+| Design notes said "all metadata writes are journaled" | Only `create` is journaled; the other operations and the lack of `fsync` are stated plainly |
+| `prepare_add_entry` → `(block_num, block_data)`; `remove_entry` "zeroes the inode field" | Current signatures (`Option` returns, `has_space_for`); removal sets the entry's inode to 0 so the slot can be reused |
+| "Requirements: Rust 1.75+" | Rust 1.85+ (the crates use edition 2024) |
+| fsck table without the new checks | Adds the valid-file-type and duplicate-name checks |
+| Note predicting fsck would be ~3× slower with 6,400 inodes | Removed: the re-run showed the inode count makes no measurable difference |
+
+Added:
+- A note at the top: REPORT.pdf describes the submitted version, and the README describes the current code.
+- A request-flow diagram, the submitted version's layout (2,048 inodes) and a layout table for other image sizes (and the ~130 MiB limit).
+- Daemon error behaviour, a Testing section (`cargo test`, `scripts/e2e_test.sh`), a "Changes since the report" table and Known Limitations.
+- **Benchmarks:** the original report numbers and text are kept word for word under "Original results". A new "Re-run after the fixes" section beside them gives the controlled old-vs-new results, what each difference means, and the methodology lessons.
+
+---
+
 ### Fixed: small bugs left after the rename fix (mkdir leak, wrong error on full disk, fsck blind spots, panics on bad arguments, rename edge cases)
 
 **Date:** 2026-11-16
